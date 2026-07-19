@@ -26,6 +26,13 @@ RUN sbt update
 COPY src src
 RUN sbt assembly
 
+# --- test stage --------------------------------------------------------
+# `docker build --target test .` runs the full test suite as a CI gate,
+# with no need for a separately provisioned JDK/sbt on the CI runner --
+# reuses this same build stage's warm dependency cache.
+FROM build AS test
+RUN sbt test
+
 # --- runtime stage ---------------------------------------------------------
 FROM eclipse-temurin:21-jre-jammy
 WORKDIR /app

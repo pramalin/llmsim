@@ -4,14 +4,26 @@ name: Publish Docker images
 #   git tag v0.1.0 && git push origin v0.1.0
 #
 # Publishes TWO images to GHCR:
-#   ghcr.io/<owner>/llmsim-build:<version>  -- the compiled engine, meant to
-#     be used as a FROM base by other projects that add their own script
-#     file(s) and re-run `sbt assembly` (see README: "Using llmsim in an
-#     app's end-to-end tests" -> Pattern A).
+#   ghcr.io/<owner>/llmsim-build:<version>  -- a reusable build environment
+#     (llmsim's source API, resolved dependencies, and compiled build
+#     cache), meant to be used as a FROM base by other projects that add
+#     their own script file(s) and re-run `sbt assembly` (see README:
+#     "Using llmsim in an app's end-to-end tests" -> Pattern A).
 #   ghcr.io/<owner>/llmsim:<version>        -- the standalone runtime image
 #     with the bundled example scripts, for trying llmsim on its own.
 #
-# Both also get a floating `:latest` tag.
+# Both also get a floating `:latest` tag -- for evaluation only. Pin a
+# released version (e.g. llmsim-build:0.1.0) in application repositories;
+# `latest` can change out from under a build you didn't touch.
+#
+# Before anything is pushed:
+#   1. The full test suite runs (`docker build --target test`).
+#   2. llmsim-build is built (not yet pushed) and a consumer smoke-test
+#      fixture (ci/smoke-test/) is built against it and actually run,
+#      proving the documented Pattern A extension mechanism still works
+#      against the exact image about to ship -- not just that llmsim's
+#      own code compiles.
+# Only if both pass does anything get pushed to GHCR.
 
 on:
   push:
@@ -43,21 +55,79 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push the reusable build-stage image
+      - name: Run the test suite (gates everything below)
+        run: docker build --target test .
+
+      - name: Docker metadata for llmsim-build
+        id: meta_build
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/llmsim-build
+          tags: |
+            type=raw,value=${{ steps.version.outputs.version }}
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.description=Reusable build environment for llmsim -- source API, resolved dependencies, and compiled build cache. See README "Using llmsim in an app's end-to-end tests".
+            org.opencontainers.image.licenses=Apache-2.0
+
+      - name: Build llmsim-build (not pushed yet -- smoke test gates the push)
         uses: docker/build-push-action@v6
         with:
           context: .
           target: build
-          push: true
+          push: false
+          load: true
+          tags: ${{ steps.meta_build.outputs.tags }}
+          labels: ${{ steps.meta_build.outputs.labels }}
+
+      - name: Build the consumer smoke-test fixture against it
+        run: |
+          docker build \
+            --build-arg LLMSIM_BUILD_IMAGE=ghcr.io/${{ github.repository_owner }}/llmsim-build:${{ steps.version.outputs.version }} \
+            -t llmsim-smoke-test \
+            ci/smoke-test
+
+      - name: Run the fixture and verify the documented extension pattern actually works
+        run: |
+          docker run -d --name llmsim-smoke -p 18089:8089 llmsim-smoke-test
+
+          for i in $(seq 1 20); do
+            curl -sf http://localhost:18089/_llmsim/calls > /dev/null && break
+            sleep 1
+          done
+
+          RESPONSE=$(curl -sf -X POST http://localhost:18089/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hello"}]}')
+          echo "$RESPONSE"
+          echo "$RESPONSE" | grep -q "smoke test ok"
+
+          curl -sf http://localhost:18089/_llmsim/calls | grep -q "smoke test ok"
+
+          docker logs llmsim-smoke
+          docker rm -f llmsim-smoke
+
+      - name: Push llmsim-build (smoke test passed)
+        run: |
+          docker push ghcr.io/${{ github.repository_owner }}/llmsim-build:${{ steps.version.outputs.version }}
+          docker push ghcr.io/${{ github.repository_owner }}/llmsim-build:latest
+
+      - name: Docker metadata for llmsim
+        id: meta_standalone
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/llmsim
           tags: |
-            ghcr.io/${{ github.repository_owner }}/llmsim-build:${{ steps.version.outputs.version }}
-            ghcr.io/${{ github.repository_owner }}/llmsim-build:latest
+            type=raw,value=${{ steps.version.outputs.version }}
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.description=Deterministic OpenAI and Anthropic API simulator for testing agentic applications
+            org.opencontainers.image.licenses=Apache-2.0
 
       - name: Build and push the standalone runtime image
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/llmsim:${{ steps.version.outputs.version }}
-            ghcr.io/${{ github.repository_owner }}/llmsim:latest
+          tags: ${{ steps.meta_standalone.outputs.tags }}
+          labels: ${{ steps.meta_standalone.outputs.labels }}

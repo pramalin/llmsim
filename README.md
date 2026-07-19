@@ -276,9 +276,17 @@ most clients still require *something* non-empty to be configured.
 Every tagged release publishes two images to GHCR: `ghcr.io/pramalin/llmsim:<version>`
 (a ready-to-run standalone image, bundled example scripts, for exactly the
 `docker compose up` walkthrough above) and `ghcr.io/pramalin/llmsim-build:<version>`
-(the compiled *engine*, meant to be used as a build-time dependency — see
-below). Your own project's script never needs to live inside llmsim's
-repo, and llmsim's engine source never needs to be copied into yours.
+— a reusable build environment: llmsim's source API, its resolved
+dependencies, and a warm compiled build cache, meant to be used as a
+build-time dependency (see below) — that's why you still run `sbt assembly`
+against it rather than it being something already fully built. Your own
+project's script never needs to live inside llmsim's repo, and llmsim's
+engine source never needs to be copied into yours.
+
+**Pin a released version** (`llmsim-build:0.1.0`, as below) in application
+repositories — an unrelated llmsim release shouldn't be able to break your
+build out from under you. `:latest` exists for quickly evaluating llmsim
+itself, not for building on top of.
 
 Your project gets its own tiny `Dockerfile` (e.g. `llmsim/Dockerfile` in
 your repo) that layers just your script on top of the published engine:
@@ -422,10 +430,13 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-This builds and pushes `ghcr.io/pramalin/llmsim-build:0.1.0` (the engine,
-for other projects to build their own scripts against — see "Using
-llmsim in an app's end-to-end tests" above) and `ghcr.io/pramalin/llmsim:0.1.0`
-(the standalone image), each also tagged `:latest`.
+This runs the full test suite, builds `ghcr.io/pramalin/llmsim-build:0.1.0`
+and runs a consumer smoke test against it (`ci/smoke-test/`) — a tiny
+fixture script, built and run exactly the way a real consuming project's
+Dockerfile would, proving the documented Pattern A extension mechanism
+actually still works against this exact image. Only if the tests and the
+smoke test both pass does anything get pushed: `llmsim-build:0.1.0` and
+`llmsim:0.1.0` (the standalone image), each also tagged `:latest`.
 
 ## Testing
 
