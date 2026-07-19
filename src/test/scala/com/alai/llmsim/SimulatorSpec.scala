@@ -8,7 +8,7 @@ import org.http4s.circe._
 import org.http4s.implicits._
 import org.scalatest.freespec.AsyncFreeSpec
 import org.scalatest.matchers.should.Matchers
-import io.circe.Decoder
+import io.circe.{Decoder, Json}
 import io.circe.generic.semiauto.deriveDecoder
 
 import Script._
@@ -33,6 +33,8 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
     jsonOf[IO, Anthropic.MessagesResponse]
 
   private implicit val capturedCallDecoder: Decoder[CapturedCall] = deriveDecoder
+  private implicit val callRespDec: EntityDecoder[IO, CapturedCall] =
+    jsonOf[IO, CapturedCall]
   private implicit val callsRespDec: EntityDecoder[IO, List[CapturedCall]] =
     jsonOf[IO, List[CapturedCall]]
 
@@ -129,8 +131,19 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
     } yield {
       calls.map(_.provider) shouldBe List("openai", "anthropic")
       calls.map(_.stepIndex) shouldBe List(Some(0), Some(1))
-      calls(0).request.spaces2 should include("hello there")
-      calls(1).request.spaces2 should include("hi again")
+      calls(0).rawRequest.spaces2 should include("hello there")
+      calls(1).rawRequest.spaces2 should include("hi again")
+    }
+  }
+
+  "captured calls include normalized model and message fields" in {
+    for {
+      c     <- clientFor(Script.exactly(reply("ok")))
+      _     <- c.expect[OpenAI.ChatResponse](openAIRequest("please help"))
+      calls <- c.expect[List[CapturedCall]](Request[IO](Method.GET, uri"/_llmsim/calls"))
+    } yield {
+      calls.head.model shouldBe Some("gpt-4o-mini")
+      calls.head.messages shouldBe Vector(CapturedMessage("user", "please help"))
     }
   }
 
@@ -141,6 +154,48 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
       _     <- c.run(openAIRequest()).use(_ => IO.unit) // second call: exhausted
       calls <- c.expect[List[CapturedCall]](Request[IO](Method.GET, uri"/_llmsim/calls"))
     } yield calls.map(_.stepIndex) shouldBe List(Some(0), None)
+  }
+
+  "a request that fails to decode is journaled as Failed and rejected with 400" in {
+    for {
+      c     <- clientFor(Script.exactly(reply("unused")))
+      resp  <- c.run(Request[IO](Method.POST, uri"/v1/chat/completions").withEntity(Json.obj("nonsense" -> Json.fromString("x")))).use(r => IO.pure(r.status))
+      calls <- c.expect[List[CapturedCall]](Request[IO](Method.GET, uri"/_llmsim/calls"))
+    } yield {
+      resp shouldBe Status.BadRequest
+      calls should have size 1
+      calls.head.stepIndex shouldBe None
+      calls.head.outcome match {
+        case CallOutcome.Failed(_) => succeed
+        case other                 => fail(s"expected Failed, got $other")
+      }
+    }
+  }
+
+  "GET /_llmsim/calls/{sequence} returns one call, 404 if it doesn't exist" in {
+    for {
+      c        <- clientFor(Script.exactly(reply("a"), reply("b")))
+      _        <- c.expect[OpenAI.ChatResponse](openAIRequest())
+      _        <- c.expect[OpenAI.ChatResponse](openAIRequest())
+      second   <- c.expect[CapturedCall](Request[IO](Method.GET, uri"/_llmsim/calls/2"))
+      missing  <- c.run(Request[IO](Method.GET, uri"/_llmsim/calls/99")).use(r => IO.pure(r.status))
+    } yield {
+      second.sequence shouldBe 2L
+      missing shouldBe Status.NotFound
+    }
+  }
+
+  "DELETE /_llmsim/calls clears the journal but does NOT rewind the script" in {
+    for {
+      c      <- clientFor(Script.exactly(reply("a"), reply("b")))
+      _      <- c.expect[OpenAI.ChatResponse](openAIRequest())
+      _      <- c.expect[String](Request[IO](Method.DELETE, uri"/_llmsim/calls"))
+      calls  <- c.expect[List[CapturedCall]](Request[IO](Method.GET, uri"/_llmsim/calls"))
+      second <- c.expect[OpenAI.ChatResponse](openAIRequest())
+    } yield {
+      calls shouldBe empty
+      second.choices.head.message.content shouldBe "b" // continued, not rewound to "a"
+    }
   }
 
   "POST /_llmsim/reset clears the journal and rewinds the script" in {
@@ -154,5 +209,15 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
       calls shouldBe empty
       afterReset.choices.head.message.content shouldBe "a" // back to the first step
     }
+  }
+
+  "the journal is bounded: oldest entries are dropped once the cap is exceeded" in {
+    for {
+      journal <- CallJournal.inMemory(maxEntries = 2)
+      _       <- journal.record("openai", None, Vector.empty, Json.obj(), CallOutcome.Responded(200, Json.obj()), Some(0))
+      _       <- journal.record("openai", None, Vector.empty, Json.obj(), CallOutcome.Responded(200, Json.obj()), Some(1))
+      _       <- journal.record("openai", None, Vector.empty, Json.obj(), CallOutcome.Responded(200, Json.obj()), Some(2))
+      calls   <- journal.all
+    } yield calls.map(_.sequence) shouldBe List(2L, 3L)
   }
 }

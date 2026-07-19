@@ -96,9 +96,11 @@ back to the first one).
 
 ## Inspecting captured calls
 
-Every call the simulator answers is recorded — provider, the raw request
-body, which script step answered it, and when. Your test harness (never
-the app under test) can read this back afterward:
+Every call the simulator receives is recorded — provider, a normalized
+model/messages view (so you don't need to know both vendors' JSON shapes
+just to check what was asked), the raw request body, what it was answered
+with, and when. Your test harness (never the app under test) reads this
+back afterward:
 
 ```bash
 curl -s http://localhost:8089/_llmsim/calls
@@ -109,20 +111,37 @@ curl -s http://localhost:8089/_llmsim/calls
   {
     "sequence": 1,
     "provider": "openai",
-    "request": { "model": "gpt-4o-mini", "messages": [ ... ] },
+    "model": "gpt-4o-mini",
+    "messages": [ { "role": "user", "content": "hello" } ],
+    "rawRequest": { "model": "gpt-4o-mini", "messages": [ ... ] },
+    "outcome": { "type": "responded", "status": 200, "body": { ... } },
     "stepIndex": 0,
     "receivedAtEpochMillis": 1732000000000
   }
 ]
 ```
 
-`stepIndex` is `null` if the call arrived after the script ran out (an
-`Overrun.Fail` call, for example) — there was no step to attribute it to.
+`outcome.type` is one of:
+- `"responded"` — answered normally; `body` is the exact response sent.
+- `"rejected"` — answered with a deliberate error, either an `error(...)`
+  script step or the script running out (`Overrun.Fail`).
+- `"failed"` — the request body couldn't be decoded at all; no script
+  step was consumed, so `stepIndex` is `null`.
 
-`POST /_llmsim/reset` clears the journal and rewinds the script back to
-its first step, so a test suite can reuse one running simulator across
-many test cases instead of restarting the container between each one.
-`GET /_llmsim/status` gives a quick call count.
+Other endpoints:
+
+- `GET /_llmsim/calls/{sequence}` — a single call by its sequence number
+  (404 if it doesn't exist).
+- `GET /_llmsim/status` — a quick call count.
+- `DELETE /_llmsim/calls` — clears the journal only; the script keeps
+  going from wherever it was.
+- `POST /_llmsim/reset` — clears the journal *and* rewinds the script back
+  to its first step, so a test suite can reuse one running simulator
+  across many test cases instead of restarting the container each time.
+
+The journal is bounded (1000 entries by default, oldest dropped first) so
+a long-running simulator can't grow it without limit — override with
+`LLMSIM_JOURNAL_MAX_ENTRIES`.
 
 These all live under `/_llmsim/...`, separate from the simulated vendor
 paths under `/v1/...` — the application under test only ever sees the

@@ -12,9 +12,9 @@ import org.http4s.implicits._
   * decides how those two route sets fit together.
   */
 object App {
-  def build(script: Script): IO[HttpApp[IO]] =
+  def build(script: Script, journalMaxEntries: Int = CallJournal.DefaultMaxEntries): IO[HttpApp[IO]] =
     for {
       runner  <- ScriptRunner.from(script)
-      journal <- CallJournal.inMemory
+      journal <- CallJournal.inMemory(journalMaxEntries)
     } yield (Simulator.routes(runner, journal) <+> ManagementRoutes.routes(journal, runner)).orNotFound
 }

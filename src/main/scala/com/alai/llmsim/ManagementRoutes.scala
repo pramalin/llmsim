@@ -1,6 +1,7 @@
 package com.alai.llmsim
 
 import cats.effect.IO
+import cats.syntax.all._
 import org.http4s._
 import org.http4s.dsl.io._
 import org.http4s.circe._
@@ -17,6 +18,8 @@ object ManagementRoutes {
   final case class StatusResponse(totalCalls: Int)
 
   private implicit val capturedCallEncoder: Encoder[CapturedCall] = deriveEncoder
+  private implicit val callEntityEncoder: EntityEncoder[IO, CapturedCall] =
+    jsonEncoderOf[IO, CapturedCall]
   private implicit val callsEntityEncoder: EntityEncoder[IO, List[CapturedCall]] =
     jsonEncoderOf[IO, List[CapturedCall]]
 
@@ -30,16 +33,28 @@ object ManagementRoutes {
       case GET -> Root / "_llmsim" / "calls" =>
         journal.all.flatMap(calls => Ok(calls))
 
+      // One call by its sequence number.
+      case GET -> Root / "_llmsim" / "calls" / LongVar(sequence) =>
+        journal.find(sequence).flatMap {
+          case Some(call) => Ok(call)
+          case None       => NotFound(s"no captured call with sequence $sequence")
+        }
+
       // A quick summary, mainly for a human checking things are alive.
       case GET -> Root / "_llmsim" / "status" =>
         journal.all.flatMap(calls => Ok(StatusResponse(totalCalls = calls.size)))
+
+      // Clears the journal ONLY -- script position is untouched, so the
+      // simulator carries on from wherever it was.
+      case DELETE -> Root / "_llmsim" / "calls" =>
+        journal.clear *> Ok("journal cleared")
 
       // Clears the journal AND rewinds the script back to its first step --
       // lets a test suite reuse one running simulator across many test
       // cases without restarting the container between them.
       case POST -> Root / "_llmsim" / "reset" =>
         for {
-          _      <- journal.reset
+          _      <- journal.clear
           _      <- runner.reset
           result <- Ok("reset")
         } yield result
