@@ -35,11 +35,26 @@ object Main extends IOApp.Simple {
     }
   }
 
+  private def parseJournalMaxEntries(value: Option[String]): IO[Int] =
+    value match {
+      case None => IO.pure(CallJournal.DefaultMaxEntries)
+      case Some(raw) =>
+        IO.fromEither(
+          raw.toIntOption
+            .filter(_ > 0)
+            .toRight(
+              new IllegalArgumentException(
+                s"LLMSIM_JOURNAL_MAX_ENTRIES must be a positive integer, received: '$raw'"
+              )
+            )
+        )
+    }
+
   def run: IO[Unit] =
     for {
       className  <- IO(sys.env.getOrElse("LLMSIM_SCRIPT", DefaultScriptClass))
       script     <- loadScript(className)
-      maxEntries <- IO(sys.env.get("LLMSIM_JOURNAL_MAX_ENTRIES").map(_.toInt).getOrElse(CallJournal.DefaultMaxEntries))
+      maxEntries <- parseJournalMaxEntries(sys.env.get("LLMSIM_JOURNAL_MAX_ENTRIES"))
       _          <- IO.println(
                       s"llmsim: booting with script '$className' (${script.steps.size} step(s), " +
                         s"onOverrun=${script.onOverrun}), journal capped at $maxEntries entries"

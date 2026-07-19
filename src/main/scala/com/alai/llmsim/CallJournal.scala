@@ -92,41 +92,46 @@ trait CallJournal {
 object CallJournal {
   val DefaultMaxEntries = 1000
 
+  /** Sequence and calls live in ONE Ref, not two -- recording both in the
+    * same atomic `modify` is what guarantees sequence order always
+    * matches recording order, even under concurrent requests. Two
+    * separate Refs (as an earlier version had) can't give that guarantee:
+    * a request could grab a sequence number, then lose the race to append
+    * its own call, leaving the journal's array order out of sync with
+    * the sequence numbers it handed out.
+    */
+  private final case class JournalState(nextSequence: Long, calls: Vector[CapturedCall])
+
   /** @param maxEntries oldest entries are dropped once the journal holds
     *                    more than this many, so a long-running simulator
     *                    can't grow its call log without bound.
     */
   def inMemory(maxEntries: Int = DefaultMaxEntries): IO[CallJournal] =
-    for {
-      callsRef <- Ref.of[IO, Vector[CapturedCall]](Vector.empty)
-      seqRef   <- Ref.of[IO, Long](0)
-    } yield new CallJournal {
-      def record(
-          provider: String,
-          model: Option[String],
-          messages: Vector[CapturedMessage],
-          rawRequest: Json,
-          outcome: CallOutcome,
-          stepIndex: Option[Int]
-      ): IO[CapturedCall] =
-        for {
-          seq  <- seqRef.updateAndGet(_ + 1)
-          call =  CapturedCall(seq, provider, model, messages, rawRequest, outcome, stepIndex, System.currentTimeMillis())
-          _    <- callsRef.update { existing =>
-                    val updated = existing :+ call
-                    if (updated.size > maxEntries) updated.drop(updated.size - maxEntries) else updated
-                  }
-        } yield call
+    Ref.of[IO, JournalState](JournalState(nextSequence = 1L, calls = Vector.empty)).map { stateRef =>
+      new CallJournal {
+        def record(
+            provider: String,
+            model: Option[String],
+            messages: Vector[CapturedMessage],
+            rawRequest: Json,
+            outcome: CallOutcome,
+            stepIndex: Option[Int]
+        ): IO[CapturedCall] =
+          stateRef.modify { state =>
+            val call = CapturedCall(
+              state.nextSequence, provider, model, messages, rawRequest, outcome, stepIndex,
+              System.currentTimeMillis()
+            )
+            val retained = (state.calls :+ call).takeRight(maxEntries)
+            JournalState(state.nextSequence + 1, retained) -> call
+          }
 
-      def all: IO[List[CapturedCall]] = callsRef.get.map(_.toList)
+        def all: IO[List[CapturedCall]] = stateRef.get.map(_.calls.toList)
 
-      def find(sequence: Long): IO[Option[CapturedCall]] =
-        callsRef.get.map(_.find(_.sequence == sequence))
+        def find(sequence: Long): IO[Option[CapturedCall]] =
+          stateRef.get.map(_.calls.find(_.sequence == sequence))
 
-      def clear: IO[Unit] =
-        for {
-          _ <- callsRef.set(Vector.empty)
-          _ <- seqRef.set(0)
-        } yield ()
+        def clear: IO[Unit] = stateRef.set(JournalState(nextSequence = 1L, calls = Vector.empty))
+      }
     }
 }

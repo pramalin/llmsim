@@ -2,6 +2,7 @@ package com.alai.llmsim
 
 import cats.effect.IO
 import cats.effect.testing.scalatest.AsyncIOSpec
+import cats.syntax.parallel._
 import org.http4s._
 import org.http4s.client.Client
 import org.http4s.circe._
@@ -219,5 +220,22 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
       _       <- journal.record("openai", None, Vector.empty, Json.obj(), CallOutcome.Responded(200, Json.obj()), Some(2))
       calls   <- journal.all
     } yield calls.map(_.sequence) shouldBe List(2L, 3L)
+  }
+
+  "concurrent recordings never lose or reorder a sequence number" in {
+    val n = 200
+    for {
+      journal <- CallJournal.inMemory(maxEntries = n)
+      _       <- (1 to n).toList.parTraverse { i =>
+                   journal.record("openai", None, Vector.empty, Json.obj(), CallOutcome.Responded(200, Json.obj()), Some(i))
+                 }
+      calls   <- journal.all
+    } yield {
+      // every sequence number from 1..n present exactly once, and the
+      // array itself is in that same order -- both would fail under the
+      // old two-Ref design if two requests interleaved their two separate
+      // atomic steps (claim a sequence, then append).
+      calls.map(_.sequence) shouldBe (1L to n.toLong).toList
+    }
   }
 }

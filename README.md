@@ -134,14 +134,18 @@ Other endpoints:
   (404 if it doesn't exist).
 - `GET /_llmsim/status` — a quick call count.
 - `DELETE /_llmsim/calls` — clears the journal only; the script keeps
-  going from wherever it was.
-- `POST /_llmsim/reset` — clears the journal *and* rewinds the script back
-  to its first step, so a test suite can reuse one running simulator
-  across many test cases instead of restarting the container each time.
+  going from wherever it was. Also resets sequence numbering back to 1 —
+  the next call recorded after this gets `sequence: 1` again, not a
+  continuation of the old numbering.
+- `POST /_llmsim/reset` — clears the journal (with the same sequence reset
+  as above) *and* rewinds the script back to its first step, so a test
+  suite can reuse one running simulator across many test cases instead of
+  restarting the container each time.
 
 The journal is bounded (1000 entries by default, oldest dropped first) so
 a long-running simulator can't grow it without limit — override with
-`LLMSIM_JOURNAL_MAX_ENTRIES`.
+`LLMSIM_JOURNAL_MAX_ENTRIES`, which must be a positive integer or the
+simulator refuses to start.
 
 These all live under `/_llmsim/...`, separate from the simulated vendor
 paths under `/v1/...` — the application under test only ever sees the
