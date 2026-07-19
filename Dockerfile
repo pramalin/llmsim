@@ -31,7 +31,7 @@ FROM eclipse-temurin:21-jre-jammy
 WORKDIR /app
 COPY --from=build /build/target/scala-3.3.3/llmsim.jar /app/llmsim.jar
 
-ENV LLMSIM_SCRIPT=llmsim.scripts.Default
+ENV LLMSIM_SCRIPT=com.alai.llmsim.scripts.Default
 EXPOSE 8089
 
 ENTRYPOINT ["java", "-jar", "/app/llmsim.jar"]

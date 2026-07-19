@@ -1,5 +1,5 @@
 ThisBuild / scalaVersion := "3.3.3"
-ThisBuild / organization := "com.example"
+ThisBuild / organization := "com.alai"
 ThisBuild / version      := "0.1.0-SNAPSHOT"
 
 val http4sVersion = "0.23.27"
@@ -8,8 +8,8 @@ val circeVersion  = "0.14.9"
 lazy val root = (project in file("."))
   .settings(
     name := "llmsim",
-    Compile / mainClass := Some("llmsim.Main"),
-    assembly / mainClass := Some("llmsim.Main"),
+    Compile / mainClass := Some("com.alai.llmsim.Main"),
+    assembly / mainClass := Some("com.alai.llmsim.Main"),
     assembly / assemblyJarName := "llmsim.jar",
     assembly / assemblyMergeStrategy := {
       case PathList("META-INF", xs @ _*) => MergeStrategy.discard

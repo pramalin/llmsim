@@ -1,10 +1,10 @@
-package llmsim
+package com.alai.llmsim
 
 import cats.effect.{IO, IOApp}
 import com.comcast.ip4s._
 import org.http4s.ember.server.EmberServerBuilder
 
-/** Run with `sbt run`, or `LLMSIM_SCRIPT=llmsim.scripts.WeatherFlow sbt run`
+/** Run with `sbt run`, or `LLMSIM_SCRIPT=com.alai.llmsim.scripts.WeatherFlow sbt run`
   * to boot with a different script. There is no way to change the script
   * once the simulator is running -- that's intentional: configuration is
   * a startup-time decision, not something the traffic being served can
@@ -18,7 +18,7 @@ import org.http4s.ember.server.EmberServerBuilder
   */
 object Main extends IOApp.Simple {
 
-  private val DefaultScriptClass = "llmsim.scripts.Default"
+  private val DefaultScriptClass = "com.alai.llmsim.scripts.Default"
 
   private def loadScript(fullyQualifiedObjectName: String): IO[Script] = IO {
     // Scala objects compile to a class named "Name$" with a static

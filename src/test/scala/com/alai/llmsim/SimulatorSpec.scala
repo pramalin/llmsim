@@ -1,4 +1,4 @@
-package llmsim
+package com.alai.llmsim
 
 import cats.effect.IO
 import cats.effect.testing.scalatest.AsyncIOSpec

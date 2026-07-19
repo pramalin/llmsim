@@ -1,4 +1,4 @@
-package llmsim
+package com.alai.llmsim
 
 /** A single call gets answered by one Step. Kept deliberately small for
   * now — ToolUse (tool_use / tool_result round trips) is the next rung,

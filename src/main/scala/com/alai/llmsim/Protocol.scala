@@ -1,4 +1,4 @@
-package llmsim
+package com.alai.llmsim
 
 import io.circe.Codec
 import io.circe.generic.semiauto._
@@ -7,13 +7,13 @@ import io.circe.generic.semiauto._
   * represent a single, non-streaming request/response round trip. No
   * tool_use, no streaming deltas yet — those come later.
   *
-  * `OpenAI` and `Anthropic` are top-level objects in `package llmsim`,
-  * NOT nested inside a wrapping `Protocol` object. Two earlier attempts
-  * nested them one level deeper (`object Protocol { object OpenAI ... }`)
+  * `OpenAI` and `Anthropic` are top-level objects directly in this
+  * package, NOT nested inside a wrapping `Protocol` object. Two earlier
+  * attempts nested them one level deeper (`object Protocol { object OpenAI ... }`)
   * and required a wildcard `import Protocol._` in every consuming file;
   * that combination triggered a "not found: OpenAI" failure in this
   * environment's Scala 3 / circe-macro setup. Flattening sidesteps it
-  * and has a nice side effect: every file in `package llmsim` sees
+  * and has a nice side effect: every file in this package sees
   * `OpenAI` and `Anthropic` automatically, no import required at all.
   *
   * Codecs live in the same object as the case classes they encode, so

@@ -31,7 +31,7 @@ env var — no rebuild needed:
 
 ```bash
 docker compose down
-LLMSIM_SCRIPT=llmsim.scripts.WeatherFlow docker compose up
+LLMSIM_SCRIPT=com.alai.llmsim.scripts.WeatherFlow docker compose up
 ```
 
 Run the same curl command three times. You should see the reply change
@@ -44,11 +44,11 @@ than expected, instead of quietly hiding the mistake.
 **3. A script you write yourself.** Create a new file:
 
 ```bash
-cat > src/main/scala/llmsim/scripts/HelloWorld.scala << 'EOF'
-package llmsim.scripts
+cat > src/main/scala/com/alai/llmsim/scripts/HelloWorld.scala << 'EOF'
+package com.alai.llmsim.scripts
 
-import llmsim.{Script, ScriptSource}
-import llmsim.Script._
+import com.alai.llmsim.{Script, ScriptSource}
+import com.alai.llmsim.Script._
 
 object HelloWorld extends ScriptSource {
   val script: Script = Script.exactly(
@@ -62,7 +62,7 @@ Since this is a brand new file, this time it does need a rebuild:
 
 ```bash
 docker compose down
-LLMSIM_SCRIPT=llmsim.scripts.HelloWorld docker compose up --build
+LLMSIM_SCRIPT=com.alai.llmsim.scripts.HelloWorld docker compose up --build
 ```
 
 Run the curl command once — you get `"Hello, world!"` back. Run it again
@@ -85,7 +85,7 @@ object MyFlow extends ScriptSource {
 }
 ```
 
-Save it under `src/main/scala/llmsim/scripts/`, point `LLMSIM_SCRIPT` at
+Save it under `src/main/scala/com/alai/llmsim/scripts/`, point `LLMSIM_SCRIPT` at
 its fully-qualified name, and restart (rebuild only if the file is new;
 editing an existing script file just needs `sbt run` again, or
 `docker compose up --build`).
@@ -97,7 +97,7 @@ back to the first one).
 ## Layout
 
 ```
-src/main/scala/llmsim/
+src/main/scala/com/alai/llmsim/
   Protocol.scala       -- case classes for OpenAI ChatRequest/Response and
                            Anthropic MessagesRequest/Response, plus their
                            error-response shapes, with circe codecs inline
@@ -109,7 +109,7 @@ src/main/scala/llmsim/
     Default.scala       -- the built-in fallback script
     WeatherFlow.scala   -- an example fixed multi-call sequence
 
-src/test/scala/llmsim/
+src/test/scala/com/alai/llmsim/
   SimulatorSpec.scala           -- in-process tests of the simulator itself
   PublishedApiContractSpec.scala -- checks our case classes decode example
                                      payloads shaped like each vendor's own
@@ -120,7 +120,7 @@ src/test/scala/llmsim/
 
 ```
 sbt run                                           # boots with scripts/Default
-LLMSIM_SCRIPT=llmsim.scripts.WeatherFlow sbt run  # boots with a different script
+LLMSIM_SCRIPT=com.alai.llmsim.scripts.WeatherFlow sbt run  # boots with a different script
 ```
 
 ## Running with Docker
@@ -133,7 +133,7 @@ builds the simulator inside the image and serves it on `localhost:8089` —
 no local Scala or sbt needed. To boot with a different script:
 
 ```
-LLMSIM_SCRIPT=llmsim.scripts.WeatherFlow docker compose up
+LLMSIM_SCRIPT=com.alai.llmsim.scripts.WeatherFlow docker compose up
 ```
 
 (only add `--build` if the script is a new file that isn't in the image yet).

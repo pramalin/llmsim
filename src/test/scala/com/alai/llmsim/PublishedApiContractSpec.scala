@@ -1,4 +1,4 @@
-package llmsim
+package com.alai.llmsim
 
 import io.circe.parser.decode
 import org.scalatest.freespec.AnyFreeSpec

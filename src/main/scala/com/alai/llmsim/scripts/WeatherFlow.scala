@@ -1,7 +1,7 @@
-package llmsim.scripts
+package com.alai.llmsim.scripts
 
-import llmsim.{Script, ScriptSource}
-import llmsim.Script._
+import com.alai.llmsim.{Script, ScriptSource}
+import com.alai.llmsim.Script._
 
 /** An example of a fixed, ordered sequence: exactly three calls expected,
   * in this order. A fourth call gets a loud "script exhausted" error
