@@ -94,20 +94,57 @@ If you'd rather it not fail once the list runs out, swap `exactly` for
 `repeatingLast` (keeps giving the last reply forever) or `cycling` (loops
 back to the first one).
 
+## Inspecting captured calls
+
+Every call the simulator answers is recorded — provider, the raw request
+body, which script step answered it, and when. Your test harness (never
+the app under test) can read this back afterward:
+
+```bash
+curl -s http://localhost:8089/_llmsim/calls
+```
+
+```json
+[
+  {
+    "sequence": 1,
+    "provider": "openai",
+    "request": { "model": "gpt-4o-mini", "messages": [ ... ] },
+    "stepIndex": 0,
+    "receivedAtEpochMillis": 1732000000000
+  }
+]
+```
+
+`stepIndex` is `null` if the call arrived after the script ran out (an
+`Overrun.Fail` call, for example) — there was no step to attribute it to.
+
+`POST /_llmsim/reset` clears the journal and rewinds the script back to
+its first step, so a test suite can reuse one running simulator across
+many test cases instead of restarting the container between each one.
+`GET /_llmsim/status` gives a quick call count.
+
+These all live under `/_llmsim/...`, separate from the simulated vendor
+paths under `/v1/...` — the application under test only ever sees the
+latter.
+
 ## Layout
 
 ```
 src/main/scala/com/alai/llmsim/
-  Protocol.scala       -- case classes for OpenAI ChatRequest/Response and
-                           Anthropic MessagesRequest/Response, plus their
-                           error-response shapes, with circe codecs inline
-  Script.scala          -- the DSL: Step, Overrun, Script, ScriptSource
-  ScriptRunner.scala    -- advances through a Script's steps, one per call
-  Simulator.scala       -- http4s routes: /v1/chat/completions, /v1/messages
-  Main.scala            -- loads a script by name (LLMSIM_SCRIPT) and serves it
+  Protocol.scala        -- case classes for OpenAI ChatRequest/Response and
+                            Anthropic MessagesRequest/Response, plus their
+                            error-response shapes, with circe codecs inline
+  Script.scala           -- the DSL: Step, Overrun, Script, ScriptSource
+  ScriptRunner.scala     -- advances through a Script's steps, one per call
+  CallJournal.scala      -- records every call for later inspection
+  Simulator.scala        -- http4s routes: /v1/chat/completions, /v1/messages
+  ManagementRoutes.scala -- test-harness routes: /_llmsim/calls, /status, /reset
+  App.scala              -- combines both route sets into one HttpApp
+  Main.scala             -- loads a script by name (LLMSIM_SCRIPT) and serves it
   scripts/
-    Default.scala       -- the built-in fallback script
-    WeatherFlow.scala   -- an example fixed multi-call sequence
+    Default.scala        -- the built-in fallback script
+    WeatherFlow.scala    -- an example fixed multi-call sequence
 
 src/test/scala/com/alai/llmsim/
   SimulatorSpec.scala           -- in-process tests of the simulator itself
@@ -153,11 +190,12 @@ docs rather than making a live call.
 
 1. ~~Single canned response~~ — done
 2. ~~Scriptable responses~~ — done
-3. Multi-turn state: `tool_use` -> `tool_result` round trips, so a script
+3. ~~Captured-call journal~~ — done (`/_llmsim/calls`, `/_llmsim/status`, `/_llmsim/reset`)
+4. Multi-turn state: `tool_use` -> `tool_result` round trips, so a script
    step can be a tool call and the simulator can react to the tool result
    your app sends back in the next request
-4. Streaming responses (SSE)
-5. Fault injection beyond fixed-status errors: artificial latency,
+5. Streaming responses (SSE)
+6. Fault injection beyond fixed-status errors: artificial latency,
    truncated streams, malformed JSON
-6. A way to inspect, after a test run, exactly what your app sent at each
-   step — turning this into a regression harness for agent behavior
+7. Per-provider or per-test-run session isolation, so concurrent tests
+   don't share one script position (currently global to the process)

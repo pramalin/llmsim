@@ -8,13 +8,15 @@ import org.http4s.circe._
 import org.http4s.implicits._
 import org.scalatest.freespec.AsyncFreeSpec
 import org.scalatest.matchers.should.Matchers
+import io.circe.Decoder
+import io.circe.generic.semiauto.deriveDecoder
 
 import Script._
 
 /** In-process tests: `Client.fromHttpApp` runs the routes without a real
-  * socket. Every test builds its own ScriptRunner from its own Script, so
-  * tests never interfere with each other's step position -- there's no
-  * shared mutable scenario table left to worry about.
+  * socket. Every test builds its own App (its own ScriptRunner and
+  * CallJournal) from its own Script, so tests never interfere with each
+  * other's state.
   */
 class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
 
@@ -30,8 +32,12 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
   private implicit val anthropicRespDec: EntityDecoder[IO, Anthropic.MessagesResponse] =
     jsonOf[IO, Anthropic.MessagesResponse]
 
+  private implicit val capturedCallDecoder: Decoder[CapturedCall] = deriveDecoder
+  private implicit val callsRespDec: EntityDecoder[IO, List[CapturedCall]] =
+    jsonOf[IO, List[CapturedCall]]
+
   private def clientFor(script: Script): IO[Client[IO]] =
-    ScriptRunner.from(script).map(runner => Client.fromHttpApp(Simulator.routes(runner).orNotFound))
+    App.build(script).map(Client.fromHttpApp)
 
   private def openAIRequest(text: String = "hi"): Request[IO] =
     Request[IO](Method.POST, uri"/v1/chat/completions")
@@ -111,6 +117,42 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
     } yield {
       resp._1 shouldBe Status.TooManyRequests
       resp._2.error.message shouldBe "rate limited by script"
+    }
+  }
+
+  "the call journal records every call, with provider and step index" in {
+    for {
+      c      <- clientFor(Script.exactly(reply("first"), reply("second")))
+      _      <- c.expect[OpenAI.ChatResponse](openAIRequest("hello there"))
+      _      <- c.expect[Anthropic.MessagesResponse](anthropicRequest("hi again"))
+      calls  <- c.expect[List[CapturedCall]](Request[IO](Method.GET, uri"/_llmsim/calls"))
+    } yield {
+      calls.map(_.provider) shouldBe List("openai", "anthropic")
+      calls.map(_.stepIndex) shouldBe List(Some(0), Some(1))
+      calls(0).request.spaces2 should include("hello there")
+      calls(1).request.spaces2 should include("hi again")
+    }
+  }
+
+  "an exhausted call is journaled with no step index" in {
+    for {
+      c     <- clientFor(Script.exactly(reply("only step")))
+      _     <- c.expect[OpenAI.ChatResponse](openAIRequest())
+      _     <- c.run(openAIRequest()).use(_ => IO.unit) // second call: exhausted
+      calls <- c.expect[List[CapturedCall]](Request[IO](Method.GET, uri"/_llmsim/calls"))
+    } yield calls.map(_.stepIndex) shouldBe List(Some(0), None)
+  }
+
+  "POST /_llmsim/reset clears the journal and rewinds the script" in {
+    for {
+      c       <- clientFor(Script.exactly(reply("a"), reply("b")))
+      _       <- c.expect[OpenAI.ChatResponse](openAIRequest())
+      _       <- c.expect[String](Request[IO](Method.POST, uri"/_llmsim/reset"))
+      calls   <- c.expect[List[CapturedCall]](Request[IO](Method.GET, uri"/_llmsim/calls"))
+      afterReset <- c.expect[OpenAI.ChatResponse](openAIRequest())
+    } yield {
+      calls shouldBe empty
+      afterReset.choices.head.message.content shouldBe "a" // back to the first step
     }
   }
 }

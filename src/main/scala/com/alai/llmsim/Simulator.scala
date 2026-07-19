@@ -5,6 +5,7 @@ import cats.syntax.all._
 import org.http4s._
 import org.http4s.dsl.io._
 import org.http4s.circe._
+import io.circe.Json
 import java.time.Instant
 import java.util.UUID
 
@@ -17,24 +18,26 @@ import java.util.UUID
   * ONLY thing that decides what a call gets back is the Script this
   * instance was started with (see Main.scala). Configuration lives
   * entirely at startup, out of band from the traffic this serves.
+  *
+  * Every call is also recorded in the CallJournal before it's answered,
+  * so a test can inspect afterward exactly what was sent -- see
+  * ManagementRoutes.
   */
 object Simulator {
 
-  private implicit val openAIRequestDecoder: EntityDecoder[IO, OpenAI.ChatRequest] =
-    jsonOf[IO, OpenAI.ChatRequest]
+  private implicit val jsonRequestDecoder: EntityDecoder[IO, Json] = jsonOf[IO, Json]
+
   private implicit val openAIResponseEncoder: EntityEncoder[IO, OpenAI.ChatResponse] =
     jsonEncoderOf[IO, OpenAI.ChatResponse]
   private implicit val openAIErrorEncoder: EntityEncoder[IO, OpenAI.ErrorBody] =
     jsonEncoderOf[IO, OpenAI.ErrorBody]
 
-  private implicit val anthropicRequestDecoder: EntityDecoder[IO, Anthropic.MessagesRequest] =
-    jsonOf[IO, Anthropic.MessagesRequest]
   private implicit val anthropicResponseEncoder: EntityEncoder[IO, Anthropic.MessagesResponse] =
     jsonEncoderOf[IO, Anthropic.MessagesResponse]
   private implicit val anthropicErrorEncoder: EntityEncoder[IO, Anthropic.ErrorBody] =
     jsonEncoderOf[IO, Anthropic.ErrorBody]
 
-  def routes(runner: ScriptRunner): HttpRoutes[IO] =
+  def routes(runner: ScriptRunner, journal: CallJournal): HttpRoutes[IO] =
     HttpRoutes.of[IO] {
 
       // -----------------------------------------------------------------
@@ -42,10 +45,12 @@ object Simulator {
       // -----------------------------------------------------------------
       case req @ POST -> Root / "v1" / "chat" / "completions" =>
         for {
-          body    <- req.as[OpenAI.ChatRequest]
+          json    <- req.as[Json]
+          body    <- decodeOrRaise[OpenAI.ChatRequest](json)
           outcome <- runner.next
+          _       <- journal.record("openai", json, stepIndexOf(outcome))
           result  <- outcome match {
-                       case NextStep.Answer(Step.Reply(text)) =>
+                       case NextStep.Answer(Step.Reply(text), _) =>
                          Ok(
                            OpenAI.ChatResponse(
                              id = s"chatcmpl-sim-${UUID.randomUUID()}",
@@ -62,7 +67,7 @@ object Simulator {
                            )
                          )
 
-                       case NextStep.Answer(Step.Error(status, message)) =>
+                       case NextStep.Answer(Step.Error(status, message), _) =>
                          errorResponse(status, OpenAI.ErrorBody(OpenAI.ErrorDetail(message)))
 
                        case NextStep.Exhausted =>
@@ -83,10 +88,12 @@ object Simulator {
       // -----------------------------------------------------------------
       case req @ POST -> Root / "v1" / "messages" =>
         for {
-          body    <- req.as[Anthropic.MessagesRequest]
+          json    <- req.as[Json]
+          body    <- decodeOrRaise[Anthropic.MessagesRequest](json)
           outcome <- runner.next
+          _       <- journal.record("anthropic", json, stepIndexOf(outcome))
           result  <- outcome match {
-                       case NextStep.Answer(Step.Reply(text)) =>
+                       case NextStep.Answer(Step.Reply(text), _) =>
                          Ok(
                            Anthropic.MessagesResponse(
                              id = s"msg-sim-${UUID.randomUUID()}",
@@ -100,7 +107,7 @@ object Simulator {
                            )
                          )
 
-                       case NextStep.Answer(Step.Error(status, message)) =>
+                       case NextStep.Answer(Step.Error(status, message), _) =>
                          errorResponse(status, Anthropic.ErrorBody(error = Anthropic.ErrorDetail("simulated_error", message)))
 
                        case NextStep.Exhausted =>
@@ -115,6 +122,17 @@ object Simulator {
                          )
                      }
         } yield result
+    }
+
+  private def stepIndexOf(outcome: NextStep): Option[Int] = outcome match {
+    case NextStep.Answer(_, index) => Some(index)
+    case NextStep.Exhausted         => None
+  }
+
+  private def decodeOrRaise[A](json: Json)(implicit decoder: io.circe.Decoder[A]): IO[A] =
+    json.as[A] match {
+      case Right(value) => IO.pure(value)
+      case Left(error)  => IO.raiseError(new IllegalArgumentException(s"could not decode request: ${error.getMessage}"))
     }
 
   private def errorResponse[A](statusCode: Int, body: A)(implicit enc: EntityEncoder[IO, A]): IO[Response[IO]] = {

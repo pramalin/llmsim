@@ -29,7 +29,7 @@ object Main extends IOApp.Simple {
       case source: ScriptSource => source.script
       case other =>
         throw new IllegalArgumentException(
-          s"$fullyQualifiedObjectName must extend llmsim.ScriptSource " +
+          s"$fullyQualifiedObjectName must extend com.alai.llmsim.ScriptSource " +
             s"(found: ${other.getClass.getName})"
         )
     }
@@ -40,12 +40,12 @@ object Main extends IOApp.Simple {
       className <- IO(sys.env.getOrElse("LLMSIM_SCRIPT", DefaultScriptClass))
       script    <- loadScript(className)
       _         <- IO.println(s"llmsim: booting with script '$className' (${script.steps.size} step(s), onOverrun=${script.onOverrun})")
-      runner    <- ScriptRunner.from(script)
+      httpApp   <- App.build(script)
       _ <- EmberServerBuilder
              .default[IO]
              .withHost(host"0.0.0.0")
              .withPort(port"8089")
-             .withHttpApp(Simulator.routes(runner).orNotFound)
+             .withHttpApp(httpApp)
              .build
              .useForever
     } yield ()
