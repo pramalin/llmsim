@@ -1,0 +1,27 @@
+# sbt / Scala build output
+target/
+project/target/
+project/project/
+*.class
+
+# Metals / Bloop (Scala IDE tooling)
+.bloop/
+.bsp/
+.metals/
+.ammonite/
+metals.sbt
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Local env overrides (if you ever add one)
+.env
