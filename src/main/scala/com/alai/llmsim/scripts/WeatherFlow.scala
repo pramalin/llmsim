@@ -8,7 +8,7 @@ import com.alai.llmsim.Script._
   * instead of silently reusing the last reply -- useful for asserting
   * your app made exactly as many calls as you expected.
   *
-  * Run with: LLMSIM_SCRIPT=llmsim.scripts.WeatherFlow sbt run
+  * Run with: LLMSIM_SCRIPT=com.alai.llmsim.scripts.WeatherFlow sbt run
   */
 object WeatherFlow extends ScriptSource {
   val script: Script = Script.exactly(

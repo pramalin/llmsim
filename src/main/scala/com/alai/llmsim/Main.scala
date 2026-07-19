@@ -10,6 +10,8 @@ import org.http4s.ember.server.EmberServerBuilder
   * a startup-time decision, not something the traffic being served can
   * ever influence.
   *
+  * Listens on port 8089 by default; override with LLMSIM_PORT.
+  *
   * Point any OpenAI- or Anthropic-compatible client at
   * http://localhost:8089 instead of the real API host, e.g.:
   *
@@ -35,6 +37,18 @@ object Main extends IOApp.Simple {
     }
   }
 
+  private val DefaultPort = port"8089"
+
+  private def parsePort(value: Option[String]): IO[Port] =
+    value match {
+      case None => IO.pure(DefaultPort)
+      case Some(raw) =>
+        IO.fromEither(
+          Port.fromString(raw)
+            .toRight(new IllegalArgumentException(s"LLMSIM_PORT must be a valid TCP port (1-65535), received: '$raw'"))
+        )
+    }
+
   private def parseJournalMaxEntries(value: Option[String]): IO[Int] =
     value match {
       case None => IO.pure(CallJournal.DefaultMaxEntries)
@@ -55,15 +69,17 @@ object Main extends IOApp.Simple {
       className  <- IO(sys.env.getOrElse("LLMSIM_SCRIPT", DefaultScriptClass))
       script     <- loadScript(className)
       maxEntries <- parseJournalMaxEntries(sys.env.get("LLMSIM_JOURNAL_MAX_ENTRIES"))
+      port       <- parsePort(sys.env.get("LLMSIM_PORT"))
       _          <- IO.println(
                       s"llmsim: booting with script '$className' (${script.steps.size} step(s), " +
-                        s"onOverrun=${script.onOverrun}), journal capped at $maxEntries entries"
+                        s"onOverrun=${script.onOverrun}), journal capped at $maxEntries entries, " +
+                        s"listening on port ${port.value}"
                     )
       httpApp    <- App.build(script, maxEntries)
       _ <- EmberServerBuilder
              .default[IO]
              .withHost(host"0.0.0.0")
-             .withPort(port"8089")
+             .withPort(port)
              .withHttpApp(httpApp)
              .build
              .useForever

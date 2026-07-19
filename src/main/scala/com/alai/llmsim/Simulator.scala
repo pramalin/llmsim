@@ -6,6 +6,7 @@ import org.http4s._
 import org.http4s.dsl.io._
 import org.http4s.circe._
 import io.circe.Json
+import io.circe.parser.{parse => parseJson}
 import io.circe.syntax._
 import java.time.Instant
 import java.util.UUID
@@ -23,6 +24,13 @@ import java.util.UUID
   * Every call is recorded in the CallJournal before it's answered --
   * including ones whose body couldn't be decoded -- so a test can
   * inspect afterward exactly what was sent. See ManagementRoutes.
+  *
+  * A tool_use/tool_call round trip needs nothing new here beyond the
+  * ToolCall step itself: the app's follow-up request (carrying the tool
+  * result) is just the NEXT call, answered by the next script step,
+  * exactly like any other call. There's no "wait for a tool result"
+  * logic -- that would be request matching, which we deliberately keep
+  * out of the simulator (see the design discussion in the project history).
   */
 object Simulator {
 
@@ -69,11 +77,11 @@ object Simulator {
                                            choices = List(
                                              OpenAI.Choice(
                                                index = 0,
-                                               message = OpenAI.Message(role = "assistant", content = text),
+                                               message = OpenAI.Message(role = "assistant", content = Some(text)),
                                                finish_reason = "stop"
                                              )
                                            ),
-                                           usage = fakeUsage(body.messages.map(_.content).mkString(" "), text)
+                                           usage = fakeUsage(openAIPromptText(body), text)
                                          )
                                          val responseJson = response.asJson
                                          for {
@@ -81,6 +89,68 @@ object Simulator {
                                                         CallOutcome.Responded(200, responseJson), Some(idx))
                                            result <- Ok(responseJson)
                                          } yield result
+
+                                       case NextStep.Answer(Step.ToolCall(id, name, arguments), idx) =>
+                                         val response = OpenAI.ChatResponse(
+                                           id = s"chatcmpl-sim-${UUID.randomUUID()}",
+                                           created = Instant.now().getEpochSecond,
+                                           model = body.model,
+                                           choices = List(
+                                             OpenAI.Choice(
+                                               index = 0,
+                                               message = OpenAI.Message(
+                                                 role = "assistant",
+                                                 content = None,
+                                                 tool_calls = Some(List(
+                                                   OpenAI.ToolCall(id, "function", OpenAI.FunctionCall(name, arguments))
+                                                 ))
+                                               ),
+                                               finish_reason = "tool_calls"
+                                             )
+                                           ),
+                                           usage = fakeUsage(openAIPromptText(body), s"$name($arguments)")
+                                         )
+                                         val responseJson = response.asJson
+                                         for {
+                                           _      <- journal.record("openai", model, messages, json,
+                                                        CallOutcome.Responded(200, responseJson), Some(idx))
+                                           result <- Ok(responseJson)
+                                         } yield result
+
+                                       case NextStep.Answer(Step.ReplyFromToolResult(toolCallId, render), idx) =>
+                                         findOpenAIToolResult(body, toolCallId) match {
+                                           case None =>
+                                             val message = s"llmsim: this script step expected a tool_result for " +
+                                               s"tool_call_id '$toolCallId', but none was found in the request."
+                                             val errorJson = OpenAI.ErrorBody(OpenAI.ErrorDetail(message, "missing_tool_result")).asJson
+                                             for {
+                                               _      <- journal.record("openai", model, messages, json,
+                                                            CallOutcome.Failed(message), Some(idx))
+                                               result <- errorResponse(500, errorJson)
+                                             } yield result
+
+                                           case Some(resultText) =>
+                                             val text = render(resultText)
+                                             val response = OpenAI.ChatResponse(
+                                               id = s"chatcmpl-sim-${UUID.randomUUID()}",
+                                               created = Instant.now().getEpochSecond,
+                                               model = body.model,
+                                               choices = List(
+                                                 OpenAI.Choice(
+                                                   index = 0,
+                                                   message = OpenAI.Message(role = "assistant", content = Some(text)),
+                                                   finish_reason = "stop"
+                                                 )
+                                               ),
+                                               usage = fakeUsage(openAIPromptText(body), text)
+                                             )
+                                             val responseJson = response.asJson
+                                             for {
+                                               _      <- journal.record("openai", model, messages, json,
+                                                            CallOutcome.Responded(200, responseJson), Some(idx))
+                                               result <- Ok(responseJson)
+                                             } yield result
+                                         }
 
                                        case NextStep.Answer(Step.Error(status, message), idx) =>
                                          val errorJson = OpenAI.ErrorBody(OpenAI.ErrorDetail(message)).asJson
@@ -124,10 +194,7 @@ object Simulator {
                                            content = List(Anthropic.ContentBlock(`type` = "text", text = Some(text))),
                                            model = body.model,
                                            stop_reason = "end_turn",
-                                           usage = {
-                                             val u = fakeUsage(body.messages.flatMap(_.content.flatMap(_.text)).mkString(" "), text)
-                                             Anthropic.Usage(input_tokens = u.prompt_tokens, output_tokens = u.completion_tokens)
-                                           }
+                                           usage = anthropicUsage(anthropicPromptText(body), text)
                                          )
                                          val responseJson = response.asJson
                                          for {
@@ -135,6 +202,69 @@ object Simulator {
                                                         CallOutcome.Responded(200, responseJson), Some(idx))
                                            result <- Ok(responseJson)
                                          } yield result
+
+                                       case NextStep.Answer(Step.ToolCall(id, name, arguments), idx) =>
+                                         parseJson(arguments) match {
+                                           case Left(parseError) =>
+                                             val message =
+                                               s"llmsim: this script's ToolCall step (name=$name) has arguments that " +
+                                                 s"aren't valid JSON ('$arguments'), which can't be represented in " +
+                                                 s"Anthropic's tool_use.input field -- that field is a real nested JSON " +
+                                                 s"object at the wire level, not a string. This step can only be used " +
+                                                 s"against the OpenAI-shaped endpoint. (${parseError.getMessage})"
+                                             val errorJson = Anthropic.ErrorBody(error = Anthropic.ErrorDetail("simulator_error", message)).asJson
+                                             for {
+                                               _      <- journal.record("anthropic", model, messages, json,
+                                                            CallOutcome.Failed(message), Some(idx))
+                                               result <- errorResponse(500, errorJson)
+                                             } yield result
+
+                                           case Right(inputJson) =>
+                                             val response = Anthropic.MessagesResponse(
+                                               id = s"msg-sim-${UUID.randomUUID()}",
+                                               content = List(
+                                                 Anthropic.ContentBlock(`type` = "tool_use", id = Some(id), name = Some(name), input = Some(inputJson))
+                                               ),
+                                               model = body.model,
+                                               stop_reason = "tool_use",
+                                               usage = anthropicUsage(anthropicPromptText(body), s"$name(${inputJson.noSpaces})")
+                                             )
+                                             val responseJson = response.asJson
+                                             for {
+                                               _      <- journal.record("anthropic", model, messages, json,
+                                                            CallOutcome.Responded(200, responseJson), Some(idx))
+                                               result <- Ok(responseJson)
+                                             } yield result
+                                         }
+
+                                       case NextStep.Answer(Step.ReplyFromToolResult(toolCallId, render), idx) =>
+                                         findAnthropicToolResult(body, toolCallId) match {
+                                           case None =>
+                                             val message = s"llmsim: this script step expected a tool_result for " +
+                                               s"tool_use_id '$toolCallId', but none was found in the request."
+                                             val errorJson = Anthropic.ErrorBody(error = Anthropic.ErrorDetail("missing_tool_result", message)).asJson
+                                             for {
+                                               _      <- journal.record("anthropic", model, messages, json,
+                                                            CallOutcome.Failed(message), Some(idx))
+                                               result <- errorResponse(500, errorJson)
+                                             } yield result
+
+                                           case Some(resultText) =>
+                                             val text = render(resultText)
+                                             val response = Anthropic.MessagesResponse(
+                                               id = s"msg-sim-${UUID.randomUUID()}",
+                                               content = List(Anthropic.ContentBlock(`type` = "text", text = Some(text))),
+                                               model = body.model,
+                                               stop_reason = "end_turn",
+                                               usage = anthropicUsage(anthropicPromptText(body), text)
+                                             )
+                                             val responseJson = response.asJson
+                                             for {
+                                               _      <- journal.record("anthropic", model, messages, json,
+                                                            CallOutcome.Responded(200, responseJson), Some(idx))
+                                               result <- Ok(responseJson)
+                                             } yield result
+                                         }
 
                                        case NextStep.Answer(Step.Error(status, message), idx) =>
                                          val errorJson = Anthropic.ErrorBody(error = Anthropic.ErrorDetail("simulated_error", message)).asJson
@@ -159,13 +289,79 @@ object Simulator {
     }
   }
 
+  // ---------------------------------------------------------------------
+  // Journal normalization: flatten either vendor's message shape down to
+  // CapturedMessage's simple (role, content: String) view. Deliberately
+  // minimal -- rawRequest already preserves everything losslessly, so
+  // this is just a convenience projection, not a complete model of tool
+  // calls/results. See CallJournal.scala.
+  // ---------------------------------------------------------------------
+
   private def normalizeOpenAI(req: OpenAI.ChatRequest): (Option[String], Vector[CapturedMessage]) =
-    (Some(req.model), req.messages.map(m => CapturedMessage(m.role, m.content)).toVector)
+    (Some(req.model), req.messages.map(m => CapturedMessage(m.role, flattenOpenAIMessage(m))).toVector)
+
+  private def flattenOpenAIMessage(m: OpenAI.Message): String =
+    m.content.getOrElse(
+      m.tool_calls.fold("")(_.map(tc => s"[tool_call ${tc.function.name}(${tc.function.arguments})]").mkString(" "))
+    )
+
+  private def openAIPromptText(req: OpenAI.ChatRequest): String =
+    req.messages.map(flattenOpenAIMessage).mkString(" ")
 
   private def normalizeAnthropic(req: Anthropic.MessagesRequest): (Option[String], Vector[CapturedMessage]) =
-    (Some(req.model), req.messages.map { m =>
-      CapturedMessage(m.role, m.content.flatMap(_.text).mkString(" "))
-    }.toVector)
+    (Some(req.model), req.messages.map(m => CapturedMessage(m.role, flattenAnthropicMessage(m))).toVector)
+
+  private def flattenAnthropicMessage(m: Anthropic.Message): String =
+    m.content.map(flattenAnthropicBlock).mkString(" ")
+
+  private def flattenAnthropicBlock(block: Anthropic.ContentBlock): String =
+    block.text.getOrElse {
+      block.`type` match {
+        case "tool_use" =>
+          s"[tool_call ${block.name.getOrElse("?")}(${block.input.map(_.noSpaces).getOrElse("{}")})]"
+        case "tool_result" =>
+          s"[tool_result ${block.tool_use_id.getOrElse("?")}: ${block.content.map(_.noSpaces).getOrElse("")}]"
+        case _ => ""
+      }
+    }
+
+  private def anthropicPromptText(req: Anthropic.MessagesRequest): String =
+    req.messages.map(flattenAnthropicMessage).mkString(" ")
+
+  private def anthropicUsage(promptText: String, completionText: String): Anthropic.Usage = {
+    val u = fakeUsage(promptText, completionText)
+    Anthropic.Usage(input_tokens = u.prompt_tokens, output_tokens = u.completion_tokens)
+  }
+
+  // ---------------------------------------------------------------------
+  // Tool-result extraction for Step.ReplyFromToolResult. llmsim never
+  // calls any tool itself -- this just reads a value the app already put
+  // in its own request, the same way the app would hand it to a real LLM.
+  // ---------------------------------------------------------------------
+
+  private def findOpenAIToolResult(body: OpenAI.ChatRequest, toolCallId: String): Option[String] =
+    body.messages
+      .find(m => m.role == "tool" && m.tool_call_id.contains(toolCallId))
+      .flatMap(_.content)
+
+  private def findAnthropicToolResult(body: Anthropic.MessagesRequest, toolCallId: String): Option[String] =
+    body.messages
+      .flatMap(_.content)
+      .find(b => b.`type` == "tool_result" && b.tool_use_id.contains(toolCallId))
+      .flatMap(_.content)
+      .map(jsonToPlainText)
+
+  // A tool_result's content can be a plain JSON string or a structured
+  // array of content blocks -- this handles either without needing a
+  // richer model than CapturedMessage already has.
+  private def jsonToPlainText(json: Json): String =
+    json.asString.getOrElse {
+      json.asArray match {
+        case Some(items) =>
+          items.flatMap(_.asObject.flatMap(_("text")).flatMap(_.asString)).mkString(" ")
+        case None => json.noSpaces
+      }
+    }
 
   private def errorResponse(statusCode: Int, body: Json): IO[Response[IO]] = {
     val status = Status.fromInt(statusCode).getOrElse(Status.InternalServerError)

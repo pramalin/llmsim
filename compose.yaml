@@ -2,9 +2,11 @@ services:
   llmsim:
     build: .
     ports:
-      - "8089:8089"
+      # Override from the shell: LLMSIM_PORT=9000 docker compose up
+      - "${LLMSIM_PORT:-8089}:${LLMSIM_PORT:-8089}"
     environment:
       # Point this at a different fully-qualified ScriptSource object to
       # boot with a different script -- e.g. com.alai.llmsim.scripts.WeatherFlow.
       # Override from the shell: LLMSIM_SCRIPT=com.alai.llmsim.scripts.WeatherFlow docker compose up
       - LLMSIM_SCRIPT=${LLMSIM_SCRIPT:-com.alai.llmsim.scripts.Default}
+      - LLMSIM_PORT=${LLMSIM_PORT:-8089}

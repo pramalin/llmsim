@@ -44,7 +44,7 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
 
   private def openAIRequest(text: String = "hi"): Request[IO] =
     Request[IO](Method.POST, uri"/v1/chat/completions")
-      .withEntity(OpenAI.ChatRequest("gpt-4o-mini", List(OpenAI.Message("user", text))))
+      .withEntity(OpenAI.ChatRequest("gpt-4o-mini", List(OpenAI.Message("user", Some(text)))))
 
   private def anthropicRequest(text: String = "hi"): Request[IO] =
     Request[IO](Method.POST, uri"/v1/messages")
@@ -60,9 +60,9 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
       second<- c.expect[OpenAI.ChatResponse](openAIRequest())
       third <- c.expect[OpenAI.ChatResponse](openAIRequest())
     } yield {
-      first.choices.head.message.content shouldBe "first"
-      second.choices.head.message.content shouldBe "second"
-      third.choices.head.message.content shouldBe "third"
+      first.choices.head.message.content shouldBe Some("first")
+      second.choices.head.message.content shouldBe Some("second")
+      third.choices.head.message.content shouldBe Some("third")
     }
   }
 
@@ -72,7 +72,7 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
       oa   <- c.expect[OpenAI.ChatResponse](openAIRequest())
       anth <- c.expect[Anthropic.MessagesResponse](anthropicRequest())
     } yield {
-      oa.choices.head.message.content shouldBe "one script"
+      oa.choices.head.message.content shouldBe Some("one script")
       anth.content.head.text shouldBe Some("two shapes")
     }
   }
@@ -92,9 +92,9 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
       second <- c.expect[OpenAI.ChatResponse](openAIRequest())
       third  <- c.expect[OpenAI.ChatResponse](openAIRequest())
     } yield {
-      first.choices.head.message.content shouldBe "a"
-      second.choices.head.message.content shouldBe "b"
-      third.choices.head.message.content shouldBe "b"
+      first.choices.head.message.content shouldBe Some("a")
+      second.choices.head.message.content shouldBe Some("b")
+      third.choices.head.message.content shouldBe Some("b")
     }
   }
 
@@ -105,9 +105,9 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
       second <- c.expect[OpenAI.ChatResponse](openAIRequest())
       third  <- c.expect[OpenAI.ChatResponse](openAIRequest())
     } yield {
-      first.choices.head.message.content shouldBe "a"
-      second.choices.head.message.content shouldBe "b"
-      third.choices.head.message.content shouldBe "a"
+      first.choices.head.message.content shouldBe Some("a")
+      second.choices.head.message.content shouldBe Some("b")
+      third.choices.head.message.content shouldBe Some("a")
     }
   }
 
@@ -195,7 +195,7 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
       second <- c.expect[OpenAI.ChatResponse](openAIRequest())
     } yield {
       calls shouldBe empty
-      second.choices.head.message.content shouldBe "b" // continued, not rewound to "a"
+      second.choices.head.message.content shouldBe Some("b") // continued, not rewound to "a"
     }
   }
 
@@ -208,7 +208,7 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
       afterReset <- c.expect[OpenAI.ChatResponse](openAIRequest())
     } yield {
       calls shouldBe empty
-      afterReset.choices.head.message.content shouldBe "a" // back to the first step
+      afterReset.choices.head.message.content shouldBe Some("a") // back to the first step
     }
   }
 
@@ -236,6 +236,137 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
       // old two-Ref design if two requests interleaved their two separate
       // atomic steps (claim a sequence, then append).
       calls.map(_.sequence) shouldBe (1L to n.toLong).toList
+    }
+  }
+
+  "a ToolCall step against OpenAI: model requests a tool, then the follow-up call gets the next step" in {
+    for {
+      c <- clientFor(Script.exactly(
+             toolCall(id = "call-1", name = "get_weather", arguments = """{"city":"SF"}"""),
+             reply("It's sunny in SF.")
+           ))
+      first <- c.expect[OpenAI.ChatResponse](openAIRequest())
+      // the app's follow-up call carries the tool result as a "tool" role message
+      second <- c.expect[OpenAI.ChatResponse](Request[IO](Method.POST, uri"/v1/chat/completions").withEntity(
+                  OpenAI.ChatRequest("gpt-4o-mini", List(
+                    OpenAI.Message("user", Some("what's the weather in SF?")),
+                    OpenAI.Message("assistant", None, tool_calls = Some(List(
+                      OpenAI.ToolCall("call-1", "function", OpenAI.FunctionCall("get_weather", """{"city":"SF"}"""))
+                    ))),
+                    OpenAI.Message("tool", Some("72F and sunny"), tool_call_id = Some("call-1"))
+                  ))
+                ))
+    } yield {
+      first.choices.head.message.content shouldBe None
+      first.choices.head.message.tool_calls.get.head.function.name shouldBe "get_weather"
+      first.choices.head.finish_reason shouldBe "tool_calls"
+      second.choices.head.message.content shouldBe Some("It's sunny in SF.")
+    }
+  }
+
+  "a ToolCall step against Anthropic: input is a real JSON object, stop_reason is tool_use" in {
+    for {
+      c    <- clientFor(Script.exactly(toolCall(id = "call-1", name = "get_weather", arguments = """{"city":"SF"}""")))
+      resp <- c.expect[Anthropic.MessagesResponse](anthropicRequest())
+    } yield {
+      resp.stop_reason shouldBe "tool_use"
+      resp.content.head.`type` shouldBe "tool_use"
+      resp.content.head.name shouldBe Some("get_weather")
+      resp.content.head.input.flatMap(_.asObject).flatMap(_("city")).flatMap(_.asString) shouldBe Some("SF")
+    }
+  }
+
+  "a ToolCall step with malformed arguments works fine against OpenAI but fails loudly against Anthropic" in {
+    val badArgs = """{"city": """
+    for {
+      c1         <- clientFor(Script.exactly(toolCall(id = "call-1", name = "get_weather", arguments = badArgs)))
+      openAIResp <- c1.expect[OpenAI.ChatResponse](openAIRequest())
+
+      c2         <- clientFor(Script.exactly(toolCall(id = "call-1", name = "get_weather", arguments = badArgs)))
+      anthStatus <- c2.run(anthropicRequest()).use(r => IO.pure(r.status))
+      calls      <- c2.expect[List[CapturedCall]](Request[IO](Method.GET, uri"/_llmsim/calls"))
+    } yield {
+      // OpenAI's arguments field is just a string -- llmsim never validates
+      // it, so a malformed one passes straight through unchanged.
+      openAIResp.choices.head.message.tool_calls.get.head.function.arguments shouldBe badArgs
+
+      // Anthropic's input is a real nested JSON object at the wire level,
+      // so this can't be represented there -- the simulator fails loudly
+      // instead of silently coercing something misleading.
+      anthStatus shouldBe Status.InternalServerError
+      calls.head.outcome match {
+        case CallOutcome.Failed(msg) => msg should include("aren't valid JSON")
+        case other                   => fail(s"expected Failed, got $other")
+      }
+    }
+  }
+
+  "captured messages normalize a tool call to a readable summary" in {
+    for {
+      c     <- clientFor(Script.exactly(reply("unused")))
+      _     <- c.expect[OpenAI.ChatResponse](Request[IO](Method.POST, uri"/v1/chat/completions").withEntity(
+                 OpenAI.ChatRequest("gpt-4o-mini", List(
+                   OpenAI.Message("assistant", None, tool_calls = Some(List(
+                     OpenAI.ToolCall("call-1", "function", OpenAI.FunctionCall("get_weather", """{"city":"SF"}"""))
+                   )))
+                 ))
+               ))
+      calls <- c.expect[List[CapturedCall]](Request[IO](Method.GET, uri"/_llmsim/calls"))
+    } yield calls.head.messages.head.content should include("get_weather")
+  }
+
+  "a ReplyFromToolResult step against OpenAI: reply is built from the real tool result" in {
+    for {
+      c <- clientFor(Script.exactly(
+             toolCall(id = "call-1", name = "get_weather", arguments = """{"city":"SF"}"""),
+             replyFromToolResult("call-1")(result => s"The tool said: $result")
+           ))
+      _      <- c.expect[OpenAI.ChatResponse](openAIRequest())
+      second <- c.expect[OpenAI.ChatResponse](Request[IO](Method.POST, uri"/v1/chat/completions").withEntity(
+                  OpenAI.ChatRequest("gpt-4o-mini", List(
+                    OpenAI.Message("user", Some("what's the weather in SF?")),
+                    OpenAI.Message("assistant", None, tool_calls = Some(List(
+                      OpenAI.ToolCall("call-1", "function", OpenAI.FunctionCall("get_weather", """{"city":"SF"}"""))
+                    ))),
+                    OpenAI.Message("tool", Some("72F and sunny"), tool_call_id = Some("call-1"))
+                  ))
+                ))
+    } yield second.choices.head.message.content shouldBe Some("The tool said: 72F and sunny")
+  }
+
+  "a ReplyFromToolResult step against Anthropic: reply is built from the real tool_result content block" in {
+    for {
+      c <- clientFor(Script.exactly(
+             toolCall(id = "call-1", name = "get_weather", arguments = """{"city":"SF"}"""),
+             replyFromToolResult("call-1")(result => s"The tool said: $result")
+           ))
+      _      <- c.expect[Anthropic.MessagesResponse](anthropicRequest())
+      second <- c.expect[Anthropic.MessagesResponse](Request[IO](Method.POST, uri"/v1/messages").withEntity(
+                  Anthropic.MessagesRequest("claude-sonnet-5", 256, List(
+                    Anthropic.Message("user", List(Anthropic.ContentBlock("text", Some("what's the weather in SF?")))),
+                    Anthropic.Message("assistant", List(Anthropic.ContentBlock(
+                      "tool_use", id = Some("call-1"), name = Some("get_weather"),
+                      input = Some(Json.obj("city" -> Json.fromString("SF")))
+                    ))),
+                    Anthropic.Message("user", List(Anthropic.ContentBlock(
+                      "tool_result", tool_use_id = Some("call-1"), content = Some(Json.fromString("72F and sunny"))
+                    )))
+                  ))
+                ))
+    } yield second.content.head.text shouldBe Some("The tool said: 72F and sunny")
+  }
+
+  "a ReplyFromToolResult step fails loudly when no matching tool_result is found" in {
+    for {
+      c     <- clientFor(Script.exactly(replyFromToolResult("call-1")(result => s"got: $result")))
+      resp  <- c.run(openAIRequest()).use(r => IO.pure(r.status))
+      calls <- c.expect[List[CapturedCall]](Request[IO](Method.GET, uri"/_llmsim/calls"))
+    } yield {
+      resp shouldBe Status.InternalServerError
+      calls.head.outcome match {
+        case CallOutcome.Failed(msg) => msg should include("tool_call_id")
+        case other                   => fail(s"expected Failed, got $other")
+      }
     }
   }
 }

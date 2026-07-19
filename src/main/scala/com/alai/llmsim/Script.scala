@@ -1,13 +1,27 @@
 package com.alai.llmsim
 
-/** A single call gets answered by one Step. Kept deliberately small for
-  * now — ToolUse (tool_use / tool_result round trips) is the next rung,
-  * not this one.
-  */
+/** A single call gets answered by one Step. */
 sealed trait Step
 object Step {
   final case class Reply(text: String) extends Step
   final case class Error(status: Int, message: String) extends Step
+
+  /** The model requests a tool instead of replying with text. `arguments`
+    * is a raw String, matching OpenAI's wire type exactly (it's a
+    * JSON-encoded string there) -- see Protocol.scala for why, and for
+    * the Anthropic-side asymmetry this creates.
+    */
+  final case class ToolCall(id: String, name: String, arguments: String) extends Step
+
+  /** Builds its reply from the REAL tool result the app sends back in its
+    * follow-up request, instead of a fixed string. llmsim never calls any
+    * tool itself here -- it only reads the value the app already put in
+    * its own request (from a real function call or its own MCP client),
+    * exactly the same way the app would hand that value to a real LLM.
+    * If no tool_result matching `toolCallId` is found, this fails loudly
+    * rather than silently falling back to something misleading.
+    */
+  final case class ReplyFromToolResult(toolCallId: String, render: String => String) extends Step
 }
 
 /** What happens on the call AFTER the script's last step. There is no
@@ -34,6 +48,9 @@ object Script {
 
   def reply(text: String): Step               = Step.Reply(text)
   def error(status: Int, message: String): Step = Step.Error(status, message)
+  def toolCall(id: String, name: String, arguments: String): Step = Step.ToolCall(id, name, arguments)
+  def replyFromToolResult(toolCallId: String)(render: String => String): Step =
+    Step.ReplyFromToolResult(toolCallId, render)
 }
 
 /** Every startup script is a Scala object implementing this trait. Main

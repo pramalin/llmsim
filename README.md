@@ -94,6 +94,41 @@ If you'd rather it not fail once the list runs out, swap `exactly` for
 `repeatingLast` (keeps giving the last reply forever) or `cycling` (loops
 back to the first one).
 
+### Tool calls
+
+A step can also be `toolCall(id, name, arguments)` — the model requests a
+tool instead of replying with text:
+
+```scala
+Script.exactly(
+  toolCall(id = "call-1", name = "get_weather", arguments = """{"city":"San Francisco"}"""),
+  replyFromToolResult("call-1")(result => s"Here's what the tool reported: $result")
+)
+```
+
+There's nothing else to it — the app's follow-up request (carrying the
+tool result) is just the *next* call, answered by the next step, exactly
+like any other call.
+
+`arguments` is a plain string, matching OpenAI's actual wire format
+exactly (their `function.arguments` field really is a JSON-encoded
+string, not a nested object) — so it's never validated, which means a
+script can deliberately use a malformed string there to test how your app
+handles a model that emitted broken structured output. Anthropic's
+`tool_use.input` is a real nested JSON object at the wire level though,
+not a string, so that scenario only works against the OpenAI-shaped
+endpoint — a `toolCall` step with unparseable `arguments` fails loudly
+(rather than silently coercing something misleading) if the request comes
+in through the Anthropic-shaped endpoint instead.
+
+`replyFromToolResult(toolCallId)(render)` builds its reply from the REAL
+tool result your app sends back, instead of a fixed string — llmsim never
+calls any tool itself, it just reads the value your app already put in
+its own request (from a real function, or the app's own MCP client),
+exactly the way it would hand that value to a real LLM. If no tool_result
+matching `toolCallId` shows up in the request, it fails loudly rather than
+guessing.
+
 ## Inspecting captured calls
 
 Every call the simulator receives is recorded — provider, a normalized
@@ -151,6 +186,85 @@ These all live under `/_llmsim/...`, separate from the simulated vendor
 paths under `/v1/...` — the application under test only ever sees the
 latter.
 
+## Using llmsim in an app's end-to-end tests
+
+Everything above is standalone: curl against a running llmsim, no other
+service involved. Once that's working the way you expect, wiring it into
+a real application is mostly just pointing that application's model
+client at llmsim instead of the real API — the same way people point
+Spring AI at Ollama, LM Studio, or Groq today.
+
+**Spring AI**, for example, exposes the base URL and API key as ordinary
+configuration properties, for both vendor shapes:
+
+```properties
+# OpenAI-shaped
+spring.ai.openai.base-url=http://llmsim:8089/v1
+spring.ai.openai.api-key=unused
+
+# Anthropic-shaped
+spring.ai.anthropic.base-url=http://llmsim:8089
+spring.ai.anthropic.api-key=unused
+```
+
+(Anthropic's `base-url` doesn't need a `/v1` suffix — Spring AI always
+appends `/v1/messages` itself, which is exactly llmsim's path. OpenAI's
+does need it, since Spring AI appends `/chat/completions` to whatever
+base URL you give it.) The API key value is never checked by llmsim, but
+most clients still require *something* non-empty to be configured.
+
+**In docker-compose**, llmsim is just another sibling service, reached by
+the other container over the compose network's internal DNS — not
+`localhost`:
+
+```yaml
+services:
+  llmsim:
+    build: ./llmsim         # or: image: ghcr.io/you/llmsim:latest
+    environment:
+      - LLMSIM_SCRIPT=com.alai.llmsim.scripts.AnalyticsFlow
+
+  backend:
+    environment:
+      - SPRING_AI_OPENAI_BASE_URL=http://llmsim:8089/v1
+      - SPRING_AI_OPENAI_API_KEY=unused
+    depends_on:
+      - llmsim
+```
+
+**The tools stay exactly as they are.** If your app's tools query a real
+database or call out over its own MCP client, none of that changes —
+llmsim only ever tells the app *which* tool to call and with what
+arguments (deterministically, from the script); the app executes it for
+real and sends the real result back, and `replyFromToolResult` uses that
+value to build llmsim's reply. A script for an analytics agent whose
+tools hit a real Postgres data mart might look like:
+
+```scala
+object AnalyticsFlow extends ScriptSource {
+  val script: Script = Script.exactly(
+    toolCall(
+      id = "call-1",
+      name = "query_data_mart",
+      arguments = """{"sql":"select count(*) from employee"}"""
+    ),
+    replyFromToolResult("call-1")(result => s"There are $result employees.")
+  )
+}
+```
+
+**In the test itself**, assert on the app's HTTP response as usual, and
+use the call journal to confirm the app actually called the right tool
+with the right arguments along the way:
+
+```bash
+curl -s http://llmsim:8089/_llmsim/calls
+```
+
+— checking `provider`, `model`, and `messages` (or `rawRequest`, for the
+exact bytes) against what you expected the agent to send, without
+needing any assertion logic inside llmsim itself.
+
 ## Layout
 
 ```
@@ -181,6 +295,7 @@ src/test/scala/com/alai/llmsim/
 ```
 sbt run                                           # boots with scripts/Default
 LLMSIM_SCRIPT=com.alai.llmsim.scripts.WeatherFlow sbt run  # boots with a different script
+LLMSIM_PORT=9000 sbt run                          # listens on a different port (default 8089)
 ```
 
 ## Running with Docker
@@ -194,6 +309,13 @@ no local Scala or sbt needed. To boot with a different script:
 
 ```
 LLMSIM_SCRIPT=com.alai.llmsim.scripts.WeatherFlow docker compose up
+```
+
+To use a different port, `LLMSIM_PORT` controls both the container's
+listening port and the host-side mapping in `compose.yaml`:
+
+```
+LLMSIM_PORT=9000 docker compose up
 ```
 
 (only add `--build` if the script is a new file that isn't in the image yet).
@@ -214,11 +336,12 @@ docs rather than making a live call.
 1. ~~Single canned response~~ — done
 2. ~~Scriptable responses~~ — done
 3. ~~Captured-call journal~~ — done (`/_llmsim/calls`, `/_llmsim/status`, `/_llmsim/reset`)
-4. Multi-turn state: `tool_use` -> `tool_result` round trips, so a script
-   step can be a tool call and the simulator can react to the tool result
-   your app sends back in the next request
+4. ~~Tool-call round trips~~ — done (`toolCall`, and `replyFromToolResult`
+   to build a reply from the app's real tool result rather than a fixed string)
 5. Streaming responses (SSE)
-6. Fault injection beyond fixed-status errors: artificial latency,
-   truncated streams, malformed JSON
+6. Fault injection: artificial latency, HTTP failure variety beyond fixed
+   status/message, truncated streams
 7. Per-provider or per-test-run session isolation, so concurrent tests
    don't share one script position (currently global to the process)
+8. `GET /v1/models`, token-usage refinements, execution trace / timeline
+   view over the call journal
