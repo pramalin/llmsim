@@ -21,9 +21,26 @@ curl -s -X POST http://localhost:8089/v1/chat/completions \
 ```
 
 **1. The default script.** You should get back `"This is a simulated
-response."` in `choices[0].message.content`. The same request against
-`http://localhost:8089/v1/messages` (Anthropic's shape) gets the same
-text back in `content[0].text` — one running instance answers both.
+response."` in `choices[0].message.content`.
+
+The Anthropic-shaped endpoint answers from the same running instance, but
+the request shape itself is different — `max_tokens` is required, and
+each message's `content` is an array of content blocks rather than a
+plain string:
+
+```bash
+curl -s -X POST http://localhost:8089/v1/messages \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-5",
+    "max_tokens": 100,
+    "messages": [
+      {"role": "user", "content": [{"type": "text", "text": "hello"}]}
+    ]
+  }'
+```
+
+Same reply, now in `content[0].text`, with `stop_reason: "end_turn"`.
 
 **2. The example script.** `Default` and `WeatherFlow` are both already
 built into the image, so switching is just a restart with a different
@@ -69,6 +86,48 @@ Run the curl command once — you get `"Hello, world!"` back. Run it again
 and it fails loudly, because that script only has one step. That's the
 whole exercise: a script is a Scala object with a list of things to say,
 in order.
+
+**4. A tool-call round trip.** `ToolCallFlow` is also already built into
+the image:
+
+```bash
+docker compose down
+LLMSIM_SCRIPT=com.alai.llmsim.scripts.ToolCallFlow docker compose up
+```
+
+The first call gets back a tool request instead of text:
+
+```bash
+curl -s -X POST http://localhost:8089/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"what is the weather in San Francisco?"}]}'
+```
+
+Look at `choices[0].message.tool_calls` — you should see a call to
+`get_weather` with `arguments: "{\"city\":\"San Francisco\"}"`, and
+`finish_reason: "tool_calls"`. Now send the follow-up call an app would
+send, carrying a (made-up, for this example) tool result:
+
+```bash
+curl -s -X POST http://localhost:8089/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-4o-mini",
+    "messages": [
+      {"role": "user", "content": "what is the weather in San Francisco?"},
+      {"role": "assistant", "tool_calls": [
+        {"id": "call-1", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\":\"San Francisco\"}"}}
+      ]},
+      {"role": "tool", "tool_call_id": "call-1", "content": "68F and foggy"}
+    ]
+  }'
+```
+
+`choices[0].message.content` should now say `"Here's what the tool
+reported: 68F and foggy"` — built from the tool result *you* put in that
+request, not a fixed string. That's `replyFromToolResult` at work: llmsim
+never called `get_weather` itself, it just read the value back out of
+your request the same way it would from a real app's real tool call.
 
 ## Writing a script
 
@@ -213,16 +272,44 @@ does need it, since Spring AI appends `/chat/completions` to whatever
 base URL you give it.) The API key value is never checked by llmsim, but
 most clients still require *something* non-empty to be configured.
 
-**In docker-compose**, llmsim is just another sibling service, reached by
-the other container over the compose network's internal DNS — not
-`localhost`:
+**Getting llmsim's engine into your project without copying its source.**
+Every tagged release publishes two images to GHCR: `ghcr.io/pramalin/llmsim:<version>`
+(a ready-to-run standalone image, bundled example scripts, for exactly the
+`docker compose up` walkthrough above) and `ghcr.io/pramalin/llmsim-build:<version>`
+(the compiled *engine*, meant to be used as a build-time dependency — see
+below). Your own project's script never needs to live inside llmsim's
+repo, and llmsim's engine source never needs to be copied into yours.
+
+Your project gets its own tiny `Dockerfile` (e.g. `llmsim/Dockerfile` in
+your repo) that layers just your script on top of the published engine:
+
+```dockerfile
+FROM ghcr.io/pramalin/llmsim-build:0.1.0 AS build
+COPY AnalyticsFlow.scala /build/src/main/scala/com/example/agenticanalytics/llmsim/AnalyticsFlow.scala
+RUN sbt assembly
+
+FROM eclipse-temurin:21-jre-jammy
+COPY --from=build /build/target/scala-3.3.3/llmsim.jar /app/llmsim.jar
+ENV LLMSIM_SCRIPT=com.example.agenticanalytics.llmsim.AnalyticsFlow
+EXPOSE 8089
+ENTRYPOINT ["java", "-jar", "/app/llmsim.jar"]
+```
+
+Use *your own* package for the script (`com.example.agenticanalytics.llmsim`
+above, not `com.alai.llmsim.scripts`) — nothing about it needs to live
+under llmsim's own namespace, it just needs to be a `ScriptSource` object
+somewhere on the classpath. `sbt assembly` here is fast: the base image
+already has llmsim's own engine compiled and all dependencies resolved,
+so this build only compiles the one new file you added.
+
+**In docker-compose**, llmsim is just another sibling service, built from
+that small Dockerfile, reached by the other container over the compose
+network's internal DNS — not `localhost`:
 
 ```yaml
 services:
   llmsim:
-    build: ./llmsim         # or: image: ghcr.io/you/llmsim:latest
-    environment:
-      - LLMSIM_SCRIPT=com.alai.llmsim.scripts.AnalyticsFlow
+    build: ./llmsim   # the Dockerfile above, in your own repo
 
   backend:
     environment:
@@ -237,10 +324,15 @@ database or call out over its own MCP client, none of that changes —
 llmsim only ever tells the app *which* tool to call and with what
 arguments (deterministically, from the script); the app executes it for
 real and sends the real result back, and `replyFromToolResult` uses that
-value to build llmsim's reply. A script for an analytics agent whose
-tools hit a real Postgres data mart might look like:
+value to build llmsim's reply. `AnalyticsFlow.scala` — the file copied
+into the Dockerfile above — might look like:
 
 ```scala
+package com.example.agenticanalytics.llmsim
+
+import com.alai.llmsim.{Script, ScriptSource}
+import com.alai.llmsim.Script._
+
 object AnalyticsFlow extends ScriptSource {
   val script: Script = Script.exactly(
     toolCall(
@@ -320,6 +412,21 @@ LLMSIM_PORT=9000 docker compose up
 
 (only add `--build` if the script is a new file that isn't in the image yet).
 
+## Releasing new versions
+
+Pushing a version tag publishes both images to GHCR automatically (see
+`.github/workflows/publish.yml`):
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+This builds and pushes `ghcr.io/pramalin/llmsim-build:0.1.0` (the engine,
+for other projects to build their own scripts against — see "Using
+llmsim in an app's end-to-end tests" above) and `ghcr.io/pramalin/llmsim:0.1.0`
+(the standalone image), each also tagged `:latest`.
+
 ## Testing
 
 ```
@@ -338,10 +445,12 @@ docs rather than making a live call.
 3. ~~Captured-call journal~~ — done (`/_llmsim/calls`, `/_llmsim/status`, `/_llmsim/reset`)
 4. ~~Tool-call round trips~~ — done (`toolCall`, and `replyFromToolResult`
    to build a reply from the app's real tool result rather than a fixed string)
-5. Streaming responses (SSE)
-6. Fault injection: artificial latency, HTTP failure variety beyond fixed
+5. ~~Published, reusable distribution~~ — done (`ghcr.io/pramalin/llmsim-build`
+   as a dependency for consuming projects, `ghcr.io/pramalin/llmsim` standalone)
+6. Streaming responses (SSE)
+7. Fault injection: artificial latency, HTTP failure variety beyond fixed
    status/message, truncated streams
-7. Per-provider or per-test-run session isolation, so concurrent tests
+8. Per-provider or per-test-run session isolation, so concurrent tests
    don't share one script position (currently global to the process)
-8. `GET /v1/models`, token-usage refinements, execution trace / timeline
+9. `GET /v1/models`, token-usage refinements, execution trace / timeline
    view over the call journal
