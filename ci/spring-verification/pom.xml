@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <!--
+    Minimal Spring Boot plus Spring AI module whose only job is to prove
+    that a real Spring AI client correctly consumes what llmsim sends.
+    llmsim's own Scala test suite (SimulatorSpec) can only assert what it
+    sent; this module is the check on whether a real client actually
+    parsed it correctly. No MCP, no tool execution, no UI.
+  -->
+
+  <groupId>com.alai.llmsim.verify</groupId>
+  <artifactId>spring-verification</artifactId>
+  <version>0.1.0</version>
+  <packaging>jar</packaging>
+
+  <parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <!-- Spring AI 2.0 requires Spring Boot 4.0/4.1; it will not load in
+         a 3.x context. An earlier draft of this pom used 3.4.1, left
+         over from before agentic-analytics moved to spring-ai-bom
+         2.0.0, and that mismatch is exactly what produced the
+         NoClassDefFoundError on ReactiveHttpClientAutoConfiguration and
+         reactor.netty.transport.ClientTransport$ResolvedAddressSelector
+         at test time: the Spring AI BOM pulled in a 4.x
+         spring-boot-http-client transitively while this parent was
+         still supplying an incompatible older Reactor Netty for
+         everything else. 4.0.1 confirmed current on Maven Central; still
+         worth checking against agentic-analytics's actual
+         spring-boot-starter-parent (or spring-boot-dependencies)
+         version, since that's the version this module is meant to
+         track. -->
+    <version>4.0.1</version>
+    <relativePath/>
+  </parent>
+
+  <properties>
+    <java.version>21</java.version>
+    <!--
+      Deliberately a property, not hardcoded. This module's whole value
+      depends on tracking whatever Spring AI version the real consumer
+      (agentic-analytics) actually pins, currently 2.0.0, since a pass
+      here is only a meaningful proxy for real behavior if the versions
+      match.
+    -->
+    <spring-ai.version>2.0.0</spring-ai.version>
+  </properties>
+
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.springframework.ai</groupId>
+        <artifactId>spring-ai-bom</artifactId>
+        <version>${spring-ai.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.ai</groupId>
+      <artifactId>spring-ai-starter-model-openai</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.ai</groupId>
+      <artifactId>spring-ai-starter-model-anthropic</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <finalName>spring-verification</finalName>
+    <plugins>
+      <plugin>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-maven-plugin</artifactId>
+      </plugin>
+    </plugins>
+  </build>
+</project>

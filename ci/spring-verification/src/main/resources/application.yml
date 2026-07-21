@@ -1,0 +1,8 @@
+spring:
+  ai:
+    openai:
+      base-url: ${LLMSIM_OPENAI_BASE_URL:http://localhost:8089/v1}
+      api-key: unused
+    anthropic:
+      base-url: ${LLMSIM_ANTHROPIC_BASE_URL:http://localhost:8089}
+      api-key: unused
