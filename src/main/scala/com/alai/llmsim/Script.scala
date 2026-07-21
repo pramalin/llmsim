@@ -11,18 +11,29 @@ package com.alai.llmsim
   */
 final case class UsageOverride(promptTokens: Int, completionTokens: Int)
 
-/** A single call gets answered by one Step. */
+/** A single call gets answered by one Step.
+  *
+  * `headers` lets a script attach arbitrary raw HTTP response headers --
+  * most commonly OpenAI's `x-ratelimit-*` or Anthropic's
+  * `anthropic-ratelimit-*` families, or `retry-after` on a 429. Raw
+  * strings, not a structured rate-limit type: OpenAI's reset values are
+  * its own compact duration format ("6m0s") and Anthropic's are RFC 3339
+  * timestamps -- two genuinely different wire formats, and llmsim
+  * shouldn't be the thing deciding how to translate between them any
+  * more than it decides what a Reply's text should say. The script
+  * author writes the exact value that goes on the wire.
+  */
 sealed trait Step
 object Step {
-  final case class Reply(text: String, usage: Option[UsageOverride] = None) extends Step
-  final case class Error(status: Int, message: String) extends Step
+  final case class Reply(text: String, usage: Option[UsageOverride] = None, headers: Map[String, String] = Map.empty) extends Step
+  final case class Error(status: Int, message: String, headers: Map[String, String] = Map.empty) extends Step
 
   /** The model requests a tool instead of replying with text. `arguments`
     * is a raw String, matching OpenAI's wire type exactly (it's a
     * JSON-encoded string there) -- see Protocol.scala for why, and for
     * the Anthropic-side asymmetry this creates.
     */
-  final case class ToolCall(id: String, name: String, arguments: String, usage: Option[UsageOverride] = None) extends Step
+  final case class ToolCall(id: String, name: String, arguments: String, usage: Option[UsageOverride] = None, headers: Map[String, String] = Map.empty) extends Step
 
   /** Builds its reply from the REAL tool result the app sends back in its
     * follow-up request, instead of a fixed string. llmsim never calls any
@@ -32,7 +43,7 @@ object Step {
     * If no tool_result matching `toolCallId` is found, this fails loudly
     * rather than silently falling back to something misleading.
     */
-  final case class ReplyFromToolResult(toolCallId: String, render: String => String, usage: Option[UsageOverride] = None) extends Step
+  final case class ReplyFromToolResult(toolCallId: String, render: String => String, usage: Option[UsageOverride] = None, headers: Map[String, String] = Map.empty) extends Step
 }
 
 /** What happens on the call AFTER the script's last step. There is no
@@ -57,12 +68,14 @@ object Script {
   def repeatingLast(steps: Step*): Script = Script(steps.toList, Overrun.RepeatLast)
   def cycling(steps: Step*): Script       = Script(steps.toList, Overrun.Cycle)
 
-  def reply(text: String, usage: Option[UsageOverride] = None): Step = Step.Reply(text, usage)
-  def error(status: Int, message: String): Step = Step.Error(status, message)
-  def toolCall(id: String, name: String, arguments: String, usage: Option[UsageOverride] = None): Step =
-    Step.ToolCall(id, name, arguments, usage)
-  def replyFromToolResult(toolCallId: String, usage: Option[UsageOverride] = None)(render: String => String): Step =
-    Step.ReplyFromToolResult(toolCallId, render, usage)
+  def reply(text: String, usage: Option[UsageOverride] = None, headers: Map[String, String] = Map.empty): Step =
+    Step.Reply(text, usage, headers)
+  def error(status: Int, message: String, headers: Map[String, String] = Map.empty): Step =
+    Step.Error(status, message, headers)
+  def toolCall(id: String, name: String, arguments: String, usage: Option[UsageOverride] = None, headers: Map[String, String] = Map.empty): Step =
+    Step.ToolCall(id, name, arguments, usage, headers)
+  def replyFromToolResult(toolCallId: String, usage: Option[UsageOverride] = None, headers: Map[String, String] = Map.empty)(render: String => String): Step =
+    Step.ReplyFromToolResult(toolCallId, render, usage, headers)
 
   // So a script reads `reply("hi", usage = usage(promptTokens = 10, completionTokens = 20))`
   // instead of `Some(UsageOverride(10, 20))`.

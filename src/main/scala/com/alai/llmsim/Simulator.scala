@@ -10,6 +10,7 @@ import io.circe.parser.{parse => parseJson}
 import io.circe.syntax._
 import java.time.Instant
 import java.util.UUID
+import org.typelevel.ci.CIString
 import scala.concurrent.duration.FiniteDuration
 
 /** The simulator itself. Two routes, each mirroring the shape of a real
@@ -105,7 +106,7 @@ object Simulator {
                         for {
                           outcome <- runner.next
                           result  <- outcome match {
-                                       case NextStep.Answer(Step.Reply(text, usageOverride), idx) =>
+                                       case NextStep.Answer(Step.Reply(text, usageOverride, headers), idx) =>
                                          val response = OpenAI.ChatResponse(
                                            id = s"chatcmpl-sim-${UUID.randomUUID()}",
                                            created = Instant.now().getEpochSecond,
@@ -123,10 +124,10 @@ object Simulator {
                                          for {
                                            _      <- recordTimed("openai", model, messages, json,
                                                         CallOutcome.Responded(200, responseJson), Some(idx), receivedAt, startedAt)
-                                           result <- Ok(responseJson)
+                                           result <- withHeaders(Ok(responseJson), headers)
                                          } yield result
 
-                                       case NextStep.Answer(Step.ToolCall(id, name, arguments, usageOverride), idx) =>
+                                       case NextStep.Answer(Step.ToolCall(id, name, arguments, usageOverride, headers), idx) =>
                                          val response = OpenAI.ChatResponse(
                                            id = s"chatcmpl-sim-${UUID.randomUUID()}",
                                            created = Instant.now().getEpochSecond,
@@ -150,10 +151,10 @@ object Simulator {
                                          for {
                                            _      <- recordTimed("openai", model, messages, json,
                                                         CallOutcome.Responded(200, responseJson), Some(idx), receivedAt, startedAt)
-                                           result <- Ok(responseJson)
+                                           result <- withHeaders(Ok(responseJson), headers)
                                          } yield result
 
-                                       case NextStep.Answer(Step.ReplyFromToolResult(toolCallId, render, usageOverride), idx) =>
+                                       case NextStep.Answer(Step.ReplyFromToolResult(toolCallId, render, usageOverride, headers), idx) =>
                                          findOpenAIToolResult(body, toolCallId) match {
                                            case None =>
                                              val message = s"llmsim: this script step expected a tool_result for " +
@@ -184,16 +185,16 @@ object Simulator {
                                              for {
                                                _      <- recordTimed("openai", model, messages, json,
                                                             CallOutcome.Responded(200, responseJson), Some(idx), receivedAt, startedAt)
-                                               result <- Ok(responseJson)
+                                               result <- withHeaders(Ok(responseJson), headers)
                                              } yield result
                                          }
 
-                                       case NextStep.Answer(Step.Error(status, message), idx) =>
+                                       case NextStep.Answer(Step.Error(status, message, headers), idx) =>
                                          val errorJson = OpenAI.ErrorBody(OpenAI.ErrorDetail(message)).asJson
                                          for {
                                            _      <- recordTimed("openai", model, messages, json,
                                                         CallOutcome.Rejected(status, message), Some(idx), receivedAt, startedAt)
-                                           result <- errorResponse(status, errorJson)
+                                           result <- errorResponse(status, errorJson, headers)
                                          } yield result
 
                                        case NextStep.Exhausted =>
@@ -226,7 +227,7 @@ object Simulator {
                         for {
                           outcome <- runner.next
                           result  <- outcome match {
-                                       case NextStep.Answer(Step.Reply(text, usageOverride), idx) =>
+                                       case NextStep.Answer(Step.Reply(text, usageOverride, headers), idx) =>
                                          val response = Anthropic.MessagesResponse(
                                            id = s"msg-sim-${UUID.randomUUID()}",
                                            content = List(Anthropic.ContentBlock(`type` = "text", text = Some(text))),
@@ -238,10 +239,10 @@ object Simulator {
                                          for {
                                            _      <- recordTimed("anthropic", model, messages, json,
                                                         CallOutcome.Responded(200, responseJson), Some(idx), receivedAt, startedAt)
-                                           result <- Ok(responseJson)
+                                           result <- withHeaders(Ok(responseJson), headers)
                                          } yield result
 
-                                       case NextStep.Answer(Step.ToolCall(id, name, arguments, usageOverride), idx) =>
+                                       case NextStep.Answer(Step.ToolCall(id, name, arguments, usageOverride, headers), idx) =>
                                          parseJson(arguments) match {
                                            case Left(parseError) =>
                                              val message =
@@ -271,11 +272,11 @@ object Simulator {
                                              for {
                                                _      <- recordTimed("anthropic", model, messages, json,
                                                             CallOutcome.Responded(200, responseJson), Some(idx), receivedAt, startedAt)
-                                               result <- Ok(responseJson)
+                                               result <- withHeaders(Ok(responseJson), headers)
                                              } yield result
                                          }
 
-                                       case NextStep.Answer(Step.ReplyFromToolResult(toolCallId, render, usageOverride), idx) =>
+                                       case NextStep.Answer(Step.ReplyFromToolResult(toolCallId, render, usageOverride, headers), idx) =>
                                          findAnthropicToolResult(body, toolCallId) match {
                                            case None =>
                                              val message = s"llmsim: this script step expected a tool_result for " +
@@ -300,16 +301,16 @@ object Simulator {
                                              for {
                                                _      <- recordTimed("anthropic", model, messages, json,
                                                             CallOutcome.Responded(200, responseJson), Some(idx), receivedAt, startedAt)
-                                               result <- Ok(responseJson)
+                                               result <- withHeaders(Ok(responseJson), headers)
                                              } yield result
                                          }
 
-                                       case NextStep.Answer(Step.Error(status, message), idx) =>
+                                       case NextStep.Answer(Step.Error(status, message, headers), idx) =>
                                          val errorJson = Anthropic.ErrorBody(error = Anthropic.ErrorDetail("simulated_error", message)).asJson
                                          for {
                                            _      <- recordTimed("anthropic", model, messages, json,
                                                         CallOutcome.Rejected(status, message), Some(idx), receivedAt, startedAt)
-                                           result <- errorResponse(status, errorJson)
+                                           result <- errorResponse(status, errorJson, headers)
                                          } yield result
 
                                        case NextStep.Exhausted =>
@@ -401,10 +402,23 @@ object Simulator {
       }
     }
 
-  private def errorResponse(statusCode: Int, body: Json): IO[Response[IO]] = {
+  private def errorResponse(statusCode: Int, body: Json, headers: Map[String, String] = Map.empty): IO[Response[IO]] = {
     val status = Status.fromInt(statusCode).getOrElse(Status.InternalServerError)
-    Response[IO](status).withEntity(body).pure[IO]
+    withHeaders(Response[IO](status).withEntity(body).pure[IO], headers)
   }
+
+  // Attaches a script's raw headers (see Step's headers field) to an
+  // already-built response. A no-op when empty, so this is safe to wrap
+  // every response-building call site with uniformly. Added one at a
+  // time via putHeaders rather than spread as a Seq: http4s's implicit
+  // Header.Raw -> Header.ToRaw conversion applies to individual varargs
+  // arguments but not across a `: _*` spread, since the Seq's static
+  // element type has to already be Header.ToRaw for that to type-check.
+  private def withHeaders(response: IO[Response[IO]], headers: Map[String, String]): IO[Response[IO]] =
+    if (headers.isEmpty) response
+    else response.map { r =>
+      headers.foldLeft(r) { case (resp, (k, v)) => resp.putHeaders(Header.Raw(CIString(k), v)) }
+    }
 
   // A script-provided UsageOverride is used verbatim when present -- for
   // testing behavior at a specific token count precisely (a budget check,

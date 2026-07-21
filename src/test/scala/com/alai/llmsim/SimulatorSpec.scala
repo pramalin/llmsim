@@ -369,4 +369,93 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
       }
     }
   }
+
+  // ---------------------------------------------------------------------
+  // Scriptable response headers (roadmap item 2b). These are the
+  // authoritative tests for this feature -- they assert on the raw wire
+  // response, independent of any client library's interpretation of it.
+  // Whether a given Spring AI version correctly consumes these headers
+  // into ChatResponseMetadata#getRateLimit() is a separate question,
+  // answered by ci/spring-verification's own tests, not here. Raw
+  // strings throughout: llmsim relays exactly what the script wrote, it
+  // doesn't interpret or reformat a rate-limit concept -- see Step's
+  // `headers` field for why.
+  // ---------------------------------------------------------------------
+
+  "OpenAI-shaped headers" - {
+
+    "a Reply step's headers are returned verbatim on the 200 response" in {
+      for {
+        c    <- clientFor(Script.exactly(reply("hi", headers = Map(
+                  "x-ratelimit-limit-requests"     -> "60",
+                  "x-ratelimit-remaining-requests"  -> "59",
+                  "x-ratelimit-reset-requests"      -> "1s",
+                  "x-ratelimit-limit-tokens"        -> "150000",
+                  "x-ratelimit-remaining-tokens"    -> "149984",
+                  "x-ratelimit-reset-tokens"        -> "6m0s"
+                ))))
+        resp <- c.run(openAIRequest()).use(r => IO.pure(r.headers))
+      } yield {
+        resp.get(org.typelevel.ci.CIString("x-ratelimit-remaining-requests")).map(_.head.value) shouldBe Some("59")
+        resp.get(org.typelevel.ci.CIString("x-ratelimit-reset-tokens")).map(_.head.value) shouldBe Some("6m0s")
+      }
+    }
+
+    "an Error step's headers (retry-after on a 429) are returned verbatim" in {
+      for {
+        c    <- clientFor(Script.exactly(error(429, "rate limit exceeded", headers = Map(
+                  "retry-after"                    -> "5",
+                  "x-ratelimit-remaining-requests"  -> "0",
+                  "x-ratelimit-reset-requests"      -> "5s"
+                ))))
+        resp <- c.run(openAIRequest()).use(r => IO.pure((r.status, r.headers)))
+      } yield {
+        resp._1 shouldBe Status.TooManyRequests
+        resp._2.get(org.typelevel.ci.CIString("retry-after")).map(_.head.value) shouldBe Some("5")
+      }
+    }
+
+    "a declining-then-throttled sequence is fully scriptable across calls" in {
+      for {
+        c      <- clientFor(Script.exactly(
+                    reply("first", headers = Map("x-ratelimit-remaining-requests" -> "2")),
+                    reply("second", headers = Map("x-ratelimit-remaining-requests" -> "1")),
+                    error(429, "rate limit exceeded", headers = Map("retry-after" -> "5"))
+                  ))
+        first  <- c.run(openAIRequest()).use(r => IO.pure(r.headers.get(org.typelevel.ci.CIString("x-ratelimit-remaining-requests")).map(_.head.value)))
+        second <- c.run(openAIRequest()).use(r => IO.pure(r.headers.get(org.typelevel.ci.CIString("x-ratelimit-remaining-requests")).map(_.head.value)))
+        third  <- c.run(openAIRequest()).use(r => IO.pure((r.status, r.headers.get(org.typelevel.ci.CIString("retry-after")).map(_.head.value))))
+      } yield {
+        first shouldBe Some("2")
+        second shouldBe Some("1")
+        third shouldBe ((Status.TooManyRequests, Some("5")))
+      }
+    }
+
+    "no headers are added when a script doesn't specify any" in {
+      for {
+        c    <- clientFor(Script.exactly(reply("hi")))
+        resp <- c.run(openAIRequest()).use(r => IO.pure(r.headers))
+      } yield resp.get(org.typelevel.ci.CIString("x-ratelimit-remaining-requests")) shouldBe None
+    }
+  }
+
+  "Anthropic-shaped headers" - {
+
+    "a Reply step's headers use Anthropic's own header names and RFC 3339 reset format" in {
+      for {
+        c    <- clientFor(Script.exactly(reply("hi", headers = Map(
+                  "anthropic-ratelimit-requests-limit"      -> "1000",
+                  "anthropic-ratelimit-requests-remaining"  -> "999",
+                  "anthropic-ratelimit-requests-reset"      -> "2026-07-21T19:00:00Z",
+                  "anthropic-ratelimit-input-tokens-limit"  -> "40000",
+                  "anthropic-ratelimit-output-tokens-limit" -> "8000"
+                ))))
+        resp <- c.run(anthropicRequest()).use(r => IO.pure(r.headers))
+      } yield {
+        resp.get(org.typelevel.ci.CIString("anthropic-ratelimit-requests-remaining")).map(_.head.value) shouldBe Some("999")
+        resp.get(org.typelevel.ci.CIString("anthropic-ratelimit-requests-reset")).map(_.head.value) shouldBe Some("2026-07-21T19:00:00Z")
+      }
+    }
+  }
 }
