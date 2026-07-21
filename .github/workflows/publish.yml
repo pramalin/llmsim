@@ -23,7 +23,13 @@ name: Publish Docker images
 #      proving the documented Pattern A extension mechanism still works
 #      against the exact image about to ship -- not just that llmsim's
 #      own code compiles.
-# Only if both pass does anything get pushed to GHCR.
+#   3. The standalone image is built (not yet pushed), booted with the
+#      bundled VerificationFlow script, and ci/spring-verification's
+#      Maven tests run against it -- a real Spring AI client, not just
+#      llmsim's own assertions about what it sent. See that module's
+#      Javadoc for why a shared llmsim instance and a one-call-per-test
+#      script design were necessary.
+# Only if all three pass does anything get pushed to GHCR.
 
 on:
   push:
@@ -107,11 +113,6 @@ jobs:
           docker logs llmsim-smoke
           docker rm -f llmsim-smoke
 
-      - name: Push llmsim-build (smoke test passed)
-        run: |
-          docker push ghcr.io/${{ github.repository_owner }}/llmsim-build:${{ steps.version.outputs.version }}
-          docker push ghcr.io/${{ github.repository_owner }}/llmsim-build:latest
-
       - name: Docker metadata for llmsim
         id: meta_standalone
         uses: docker/metadata-action@v5
@@ -124,10 +125,55 @@ jobs:
             org.opencontainers.image.description=Deterministic OpenAI and Anthropic API simulator for testing agentic applications
             org.opencontainers.image.licenses=Apache-2.0
 
-      - name: Build and push the standalone runtime image
+      - name: Build the standalone runtime image (not pushed yet -- spring-verification gates the push)
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: true
+          push: false
+          load: true
           tags: ${{ steps.meta_standalone.outputs.tags }}
           labels: ${{ steps.meta_standalone.outputs.labels }}
+
+      - name: Boot it with the verification script
+        run: |
+          docker run -d --name llmsim-verify -p 28089:8089 \
+            -e LLMSIM_SCRIPT=com.alai.llmsim.scripts.VerificationFlow \
+            ghcr.io/${{ github.repository_owner }}/llmsim:${{ steps.version.outputs.version }}
+
+          for i in $(seq 1 20); do
+            curl -sf http://localhost:28089/_llmsim/calls > /dev/null && break
+            sleep 1
+          done
+
+      - name: Set up JDK for ci/spring-verification
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      # The real gate: not "does llmsim emit a plausible-looking
+      # response" (llmsim's own test suite already covers that) but
+      # "does a real Spring AI client parse it correctly". See
+      # ci/spring-verification/src/test/java/.../VerificationTest.java.
+      - name: Run ci/spring-verification against it
+        working-directory: ci/spring-verification
+        env:
+          LLMSIM_OPENAI_BASE_URL: http://localhost:28089/v1
+          LLMSIM_ANTHROPIC_BASE_URL: http://localhost:28089
+        run: mvn -B test
+
+      - name: Tear down the verification container
+        if: always()
+        run: |
+          docker logs llmsim-verify || true
+          docker rm -f llmsim-verify || true
+
+      - name: Push llmsim-build (smoke test and spring-verification both passed)
+        run: |
+          docker push ghcr.io/${{ github.repository_owner }}/llmsim-build:${{ steps.version.outputs.version }}
+          docker push ghcr.io/${{ github.repository_owner }}/llmsim-build:latest
+
+      - name: Push the standalone runtime image
+        run: |
+          docker push ghcr.io/${{ github.repository_owner }}/llmsim:${{ steps.version.outputs.version }}
+          docker push ghcr.io/${{ github.repository_owner }}/llmsim:latest
