@@ -215,9 +215,9 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
   "the journal is bounded: oldest entries are dropped once the cap is exceeded" in {
     for {
       journal <- CallJournal.inMemory(maxEntries = 2)
-      _       <- journal.record("openai", None, Vector.empty, Json.obj(), CallOutcome.Responded(200, Json.obj()), Some(0))
-      _       <- journal.record("openai", None, Vector.empty, Json.obj(), CallOutcome.Responded(200, Json.obj()), Some(1))
-      _       <- journal.record("openai", None, Vector.empty, Json.obj(), CallOutcome.Responded(200, Json.obj()), Some(2))
+      _       <- journal.record("openai", None, Vector.empty, Json.obj(), CallOutcome.Responded(200, Json.obj()), Some(0), System.currentTimeMillis(), System.currentTimeMillis(), 0L)
+      _       <- journal.record("openai", None, Vector.empty, Json.obj(), CallOutcome.Responded(200, Json.obj()), Some(1), System.currentTimeMillis(), System.currentTimeMillis(), 0L)
+      _       <- journal.record("openai", None, Vector.empty, Json.obj(), CallOutcome.Responded(200, Json.obj()), Some(2), System.currentTimeMillis(), System.currentTimeMillis(), 0L)
       calls   <- journal.all
     } yield calls.map(_.sequence) shouldBe List(2L, 3L)
   }
@@ -227,7 +227,7 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
     for {
       journal <- CallJournal.inMemory(maxEntries = n)
       _       <- (1 to n).toList.parTraverse { i =>
-                   journal.record("openai", None, Vector.empty, Json.obj(), CallOutcome.Responded(200, Json.obj()), Some(i))
+                   journal.record("openai", None, Vector.empty, Json.obj(), CallOutcome.Responded(200, Json.obj()), Some(i), System.currentTimeMillis(), System.currentTimeMillis(), 0L)
                  }
       calls   <- journal.all
     } yield {

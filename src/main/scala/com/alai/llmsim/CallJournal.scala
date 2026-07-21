@@ -66,7 +66,14 @@ final case class CapturedCall(
     rawRequest: Json,
     outcome: CallOutcome,
     stepIndex: Option[Int],
-    receivedAtEpochMillis: Long
+    receivedAtEpochMillis: Long,
+    completedAtEpochMillis: Long,
+    // From a monotonic clock, not (completedAtEpochMillis - receivedAtEpochMillis)
+    // -- real/wall-clock time can jump (NTP adjustment, clock skew) and
+    // is the wrong source for measuring elapsed duration. See Simulator's
+    // recordTimed, which is the only caller of `record` and is what
+    // actually captures both clocks.
+    durationMillis: Long
 )
 
 trait CallJournal {
@@ -76,7 +83,10 @@ trait CallJournal {
       messages: Vector[CapturedMessage],
       rawRequest: Json,
       outcome: CallOutcome,
-      stepIndex: Option[Int]
+      stepIndex: Option[Int],
+      receivedAtEpochMillis: Long,
+      completedAtEpochMillis: Long,
+      durationMillis: Long
   ): IO[CapturedCall]
 
   def all: IO[List[CapturedCall]]
@@ -115,12 +125,15 @@ object CallJournal {
             messages: Vector[CapturedMessage],
             rawRequest: Json,
             outcome: CallOutcome,
-            stepIndex: Option[Int]
+            stepIndex: Option[Int],
+            receivedAtEpochMillis: Long,
+            completedAtEpochMillis: Long,
+            durationMillis: Long
         ): IO[CapturedCall] =
           stateRef.modify { state =>
             val call = CapturedCall(
               state.nextSequence, provider, model, messages, rawRequest, outcome, stepIndex,
-              System.currentTimeMillis()
+              receivedAtEpochMillis, completedAtEpochMillis, durationMillis
             )
             val retained = (state.calls :+ call).takeRight(maxEntries)
             JournalState(state.nextSequence + 1, retained) -> call

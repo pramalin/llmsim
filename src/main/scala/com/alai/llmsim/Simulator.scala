@@ -1,6 +1,6 @@
 package com.alai.llmsim
 
-import cats.effect.IO
+import cats.effect.{Clock, IO}
 import cats.syntax.all._
 import org.http4s._
 import org.http4s.dsl.io._
@@ -10,6 +10,7 @@ import io.circe.parser.{parse => parseJson}
 import io.circe.syntax._
 import java.time.Instant
 import java.util.UUID
+import scala.concurrent.duration.FiniteDuration
 
 /** The simulator itself. Two routes, each mirroring the shape of a real
   * vendor endpoint closely enough that a client library pointed at
@@ -38,7 +39,40 @@ object Simulator {
 
   def routes(runner: ScriptRunner, journal: CallJournal): HttpRoutes[IO] = {
 
-    def recordFailureAndReject(provider: String, json: Json, reason: String): IO[Response[IO]] = {
+    // Captures received/completed as real (wall-clock) time -- for
+    // timeline timestamps -- and duration from monotonic time, per Cats
+    // Effect's own distinction between the two: real time can jump
+    // (NTP adjustment, clock skew) and is wrong for measuring elapsed
+    // duration, monotonic time can't be turned into a meaningful Unix
+    // timestamp. `receivedAt`/`startedAt` are captured once, at the very
+    // top of each route's for-comprehension -- before request-body
+    // decoding even happens -- so `receivedAtEpochMillis` reflects when
+    // the call actually arrived, not when it happened to finish being
+    // processed (which is what the previous single-timestamp version
+    // effectively recorded, since it stamped time inside `record` itself,
+    // after the response was already built).
+    def recordTimed(
+        provider: String,
+        model: Option[String],
+        messages: Vector[CapturedMessage],
+        rawRequest: Json,
+        outcome: CallOutcome,
+        stepIndex: Option[Int],
+        receivedAt: FiniteDuration,
+        startedAt: FiniteDuration
+    ): IO[CapturedCall] =
+      for {
+        finishedAt  <- Clock[IO].monotonic
+        completedAt <- Clock[IO].realTime
+        call        <- journal.record(
+                          provider, model, messages, rawRequest, outcome, stepIndex,
+                          receivedAt.toMillis, completedAt.toMillis, (finishedAt - startedAt).toMillis
+                        )
+      } yield call
+
+    def recordFailureAndReject(
+        provider: String, json: Json, reason: String, receivedAt: FiniteDuration, startedAt: FiniteDuration
+    ): IO[Response[IO]] = {
       val message = s"llmsim: could not decode $provider request body: $reason"
       val errorJson = Json.obj(
         "error" -> Json.obj(
@@ -47,7 +81,7 @@ object Simulator {
         )
       )
       for {
-        _      <- journal.record(provider, None, Vector.empty, json, CallOutcome.Failed(message), None)
+        _      <- recordTimed(provider, None, Vector.empty, json, CallOutcome.Failed(message), None, receivedAt, startedAt)
         result <- errorResponse(400, errorJson)
       } yield result
     }
@@ -59,17 +93,19 @@ object Simulator {
       // -----------------------------------------------------------------
       case req @ POST -> Root / "v1" / "chat" / "completions" =>
         for {
+          receivedAt <- Clock[IO].realTime
+          startedAt  <- Clock[IO].monotonic
           json   <- req.as[Json]
           result <- json.as[OpenAI.ChatRequest] match {
                       case Left(decodeError) =>
-                        recordFailureAndReject("openai", json, decodeError.getMessage)
+                        recordFailureAndReject("openai", json, decodeError.getMessage, receivedAt, startedAt)
 
                       case Right(body) =>
                         val (model, messages) = normalizeOpenAI(body)
                         for {
                           outcome <- runner.next
                           result  <- outcome match {
-                                       case NextStep.Answer(Step.Reply(text), idx) =>
+                                       case NextStep.Answer(Step.Reply(text, usageOverride), idx) =>
                                          val response = OpenAI.ChatResponse(
                                            id = s"chatcmpl-sim-${UUID.randomUUID()}",
                                            created = Instant.now().getEpochSecond,
@@ -81,16 +117,16 @@ object Simulator {
                                                finish_reason = "stop"
                                              )
                                            ),
-                                           usage = fakeUsage(openAIPromptText(body), text)
+                                           usage = fakeUsage(openAIPromptText(body), text, usageOverride)
                                          )
                                          val responseJson = response.asJson
                                          for {
-                                           _      <- journal.record("openai", model, messages, json,
-                                                        CallOutcome.Responded(200, responseJson), Some(idx))
+                                           _      <- recordTimed("openai", model, messages, json,
+                                                        CallOutcome.Responded(200, responseJson), Some(idx), receivedAt, startedAt)
                                            result <- Ok(responseJson)
                                          } yield result
 
-                                       case NextStep.Answer(Step.ToolCall(id, name, arguments), idx) =>
+                                       case NextStep.Answer(Step.ToolCall(id, name, arguments, usageOverride), idx) =>
                                          val response = OpenAI.ChatResponse(
                                            id = s"chatcmpl-sim-${UUID.randomUUID()}",
                                            created = Instant.now().getEpochSecond,
@@ -108,24 +144,24 @@ object Simulator {
                                                finish_reason = "tool_calls"
                                              )
                                            ),
-                                           usage = fakeUsage(openAIPromptText(body), s"$name($arguments)")
+                                           usage = fakeUsage(openAIPromptText(body), s"$name($arguments)", usageOverride)
                                          )
                                          val responseJson = response.asJson
                                          for {
-                                           _      <- journal.record("openai", model, messages, json,
-                                                        CallOutcome.Responded(200, responseJson), Some(idx))
+                                           _      <- recordTimed("openai", model, messages, json,
+                                                        CallOutcome.Responded(200, responseJson), Some(idx), receivedAt, startedAt)
                                            result <- Ok(responseJson)
                                          } yield result
 
-                                       case NextStep.Answer(Step.ReplyFromToolResult(toolCallId, render), idx) =>
+                                       case NextStep.Answer(Step.ReplyFromToolResult(toolCallId, render, usageOverride), idx) =>
                                          findOpenAIToolResult(body, toolCallId) match {
                                            case None =>
                                              val message = s"llmsim: this script step expected a tool_result for " +
                                                s"tool_call_id '$toolCallId', but none was found in the request."
                                              val errorJson = OpenAI.ErrorBody(OpenAI.ErrorDetail(message, "missing_tool_result")).asJson
                                              for {
-                                               _      <- journal.record("openai", model, messages, json,
-                                                            CallOutcome.Failed(message), Some(idx))
+                                               _      <- recordTimed("openai", model, messages, json,
+                                                            CallOutcome.Failed(message), Some(idx), receivedAt, startedAt)
                                                result <- errorResponse(500, errorJson)
                                              } yield result
 
@@ -142,12 +178,12 @@ object Simulator {
                                                    finish_reason = "stop"
                                                  )
                                                ),
-                                               usage = fakeUsage(openAIPromptText(body), text)
+                                               usage = fakeUsage(openAIPromptText(body), text, usageOverride)
                                              )
                                              val responseJson = response.asJson
                                              for {
-                                               _      <- journal.record("openai", model, messages, json,
-                                                            CallOutcome.Responded(200, responseJson), Some(idx))
+                                               _      <- recordTimed("openai", model, messages, json,
+                                                            CallOutcome.Responded(200, responseJson), Some(idx), receivedAt, startedAt)
                                                result <- Ok(responseJson)
                                              } yield result
                                          }
@@ -155,8 +191,8 @@ object Simulator {
                                        case NextStep.Answer(Step.Error(status, message), idx) =>
                                          val errorJson = OpenAI.ErrorBody(OpenAI.ErrorDetail(message)).asJson
                                          for {
-                                           _      <- journal.record("openai", model, messages, json,
-                                                        CallOutcome.Rejected(status, message), Some(idx))
+                                           _      <- recordTimed("openai", model, messages, json,
+                                                        CallOutcome.Rejected(status, message), Some(idx), receivedAt, startedAt)
                                            result <- errorResponse(status, errorJson)
                                          } yield result
 
@@ -164,8 +200,8 @@ object Simulator {
                                          val message = "llmsim: script exhausted -- simulator received a call beyond the configured script"
                                          val errorJson = OpenAI.ErrorBody(OpenAI.ErrorDetail(message, "script_exhausted")).asJson
                                          for {
-                                           _      <- journal.record("openai", model, messages, json,
-                                                        CallOutcome.Rejected(500, message), None)
+                                           _      <- recordTimed("openai", model, messages, json,
+                                                        CallOutcome.Rejected(500, message), None, receivedAt, startedAt)
                                            result <- errorResponse(500, errorJson)
                                          } yield result
                                      }
@@ -178,32 +214,34 @@ object Simulator {
       // -----------------------------------------------------------------
       case req @ POST -> Root / "v1" / "messages" =>
         for {
+          receivedAt <- Clock[IO].realTime
+          startedAt  <- Clock[IO].monotonic
           json   <- req.as[Json]
           result <- json.as[Anthropic.MessagesRequest] match {
                       case Left(decodeError) =>
-                        recordFailureAndReject("anthropic", json, decodeError.getMessage)
+                        recordFailureAndReject("anthropic", json, decodeError.getMessage, receivedAt, startedAt)
 
                       case Right(body) =>
                         val (model, messages) = normalizeAnthropic(body)
                         for {
                           outcome <- runner.next
                           result  <- outcome match {
-                                       case NextStep.Answer(Step.Reply(text), idx) =>
+                                       case NextStep.Answer(Step.Reply(text, usageOverride), idx) =>
                                          val response = Anthropic.MessagesResponse(
                                            id = s"msg-sim-${UUID.randomUUID()}",
                                            content = List(Anthropic.ContentBlock(`type` = "text", text = Some(text))),
                                            model = body.model,
                                            stop_reason = "end_turn",
-                                           usage = anthropicUsage(anthropicPromptText(body), text)
+                                           usage = anthropicUsage(anthropicPromptText(body), text, usageOverride)
                                          )
                                          val responseJson = response.asJson
                                          for {
-                                           _      <- journal.record("anthropic", model, messages, json,
-                                                        CallOutcome.Responded(200, responseJson), Some(idx))
+                                           _      <- recordTimed("anthropic", model, messages, json,
+                                                        CallOutcome.Responded(200, responseJson), Some(idx), receivedAt, startedAt)
                                            result <- Ok(responseJson)
                                          } yield result
 
-                                       case NextStep.Answer(Step.ToolCall(id, name, arguments), idx) =>
+                                       case NextStep.Answer(Step.ToolCall(id, name, arguments, usageOverride), idx) =>
                                          parseJson(arguments) match {
                                            case Left(parseError) =>
                                              val message =
@@ -214,8 +252,8 @@ object Simulator {
                                                  s"against the OpenAI-shaped endpoint. (${parseError.getMessage})"
                                              val errorJson = Anthropic.ErrorBody(error = Anthropic.ErrorDetail("simulator_error", message)).asJson
                                              for {
-                                               _      <- journal.record("anthropic", model, messages, json,
-                                                            CallOutcome.Failed(message), Some(idx))
+                                               _      <- recordTimed("anthropic", model, messages, json,
+                                                            CallOutcome.Failed(message), Some(idx), receivedAt, startedAt)
                                                result <- errorResponse(500, errorJson)
                                              } yield result
 
@@ -227,25 +265,25 @@ object Simulator {
                                                ),
                                                model = body.model,
                                                stop_reason = "tool_use",
-                                               usage = anthropicUsage(anthropicPromptText(body), s"$name(${inputJson.noSpaces})")
+                                               usage = anthropicUsage(anthropicPromptText(body), s"$name(${inputJson.noSpaces})", usageOverride)
                                              )
                                              val responseJson = response.asJson
                                              for {
-                                               _      <- journal.record("anthropic", model, messages, json,
-                                                            CallOutcome.Responded(200, responseJson), Some(idx))
+                                               _      <- recordTimed("anthropic", model, messages, json,
+                                                            CallOutcome.Responded(200, responseJson), Some(idx), receivedAt, startedAt)
                                                result <- Ok(responseJson)
                                              } yield result
                                          }
 
-                                       case NextStep.Answer(Step.ReplyFromToolResult(toolCallId, render), idx) =>
+                                       case NextStep.Answer(Step.ReplyFromToolResult(toolCallId, render, usageOverride), idx) =>
                                          findAnthropicToolResult(body, toolCallId) match {
                                            case None =>
                                              val message = s"llmsim: this script step expected a tool_result for " +
                                                s"tool_use_id '$toolCallId', but none was found in the request."
                                              val errorJson = Anthropic.ErrorBody(error = Anthropic.ErrorDetail("missing_tool_result", message)).asJson
                                              for {
-                                               _      <- journal.record("anthropic", model, messages, json,
-                                                            CallOutcome.Failed(message), Some(idx))
+                                               _      <- recordTimed("anthropic", model, messages, json,
+                                                            CallOutcome.Failed(message), Some(idx), receivedAt, startedAt)
                                                result <- errorResponse(500, errorJson)
                                              } yield result
 
@@ -256,12 +294,12 @@ object Simulator {
                                                content = List(Anthropic.ContentBlock(`type` = "text", text = Some(text))),
                                                model = body.model,
                                                stop_reason = "end_turn",
-                                               usage = anthropicUsage(anthropicPromptText(body), text)
+                                               usage = anthropicUsage(anthropicPromptText(body), text, usageOverride)
                                              )
                                              val responseJson = response.asJson
                                              for {
-                                               _      <- journal.record("anthropic", model, messages, json,
-                                                            CallOutcome.Responded(200, responseJson), Some(idx))
+                                               _      <- recordTimed("anthropic", model, messages, json,
+                                                            CallOutcome.Responded(200, responseJson), Some(idx), receivedAt, startedAt)
                                                result <- Ok(responseJson)
                                              } yield result
                                          }
@@ -269,8 +307,8 @@ object Simulator {
                                        case NextStep.Answer(Step.Error(status, message), idx) =>
                                          val errorJson = Anthropic.ErrorBody(error = Anthropic.ErrorDetail("simulated_error", message)).asJson
                                          for {
-                                           _      <- journal.record("anthropic", model, messages, json,
-                                                        CallOutcome.Rejected(status, message), Some(idx))
+                                           _      <- recordTimed("anthropic", model, messages, json,
+                                                        CallOutcome.Rejected(status, message), Some(idx), receivedAt, startedAt)
                                            result <- errorResponse(status, errorJson)
                                          } yield result
 
@@ -278,8 +316,8 @@ object Simulator {
                                          val message = "llmsim: script exhausted -- simulator received a call beyond the configured script"
                                          val errorJson = Anthropic.ErrorBody(error = Anthropic.ErrorDetail("script_exhausted", message)).asJson
                                          for {
-                                           _      <- journal.record("anthropic", model, messages, json,
-                                                        CallOutcome.Rejected(500, message), None)
+                                           _      <- recordTimed("anthropic", model, messages, json,
+                                                        CallOutcome.Rejected(500, message), None, receivedAt, startedAt)
                                            result <- errorResponse(500, errorJson)
                                          } yield result
                                      }
@@ -328,8 +366,8 @@ object Simulator {
   private def anthropicPromptText(req: Anthropic.MessagesRequest): String =
     req.messages.map(flattenAnthropicMessage).mkString(" ")
 
-  private def anthropicUsage(promptText: String, completionText: String): Anthropic.Usage = {
-    val u = fakeUsage(promptText, completionText)
+  private def anthropicUsage(promptText: String, completionText: String, usageOverride: Option[UsageOverride]): Anthropic.Usage = {
+    val u = fakeUsage(promptText, completionText, usageOverride)
     Anthropic.Usage(input_tokens = u.prompt_tokens, output_tokens = u.completion_tokens)
   }
 
@@ -368,11 +406,19 @@ object Simulator {
     Response[IO](status).withEntity(body).pure[IO]
   }
 
-  // Not a real tokenizer -- word count is a stand-in so downstream business
-  // logic that reads `usage` has *something* plausible to assert against.
-  private def fakeUsage(promptText: String, completionText: String): OpenAI.Usage = {
-    val promptTokens     = promptText.split("\\s+").count(_.nonEmpty)
-    val completionTokens = completionText.split("\\s+").count(_.nonEmpty)
-    OpenAI.Usage(promptTokens, completionTokens, promptTokens + completionTokens)
-  }
+  // A script-provided UsageOverride is used verbatim when present -- for
+  // testing behavior at a specific token count precisely (a budget check,
+  // a context-window boundary) rather than at whatever the heuristic
+  // below happens to produce for that step's text. Word count is only a
+  // stand-in default so a script that doesn't care still gets *something*
+  // plausible to assert against, not a real tokenizer.
+  private def fakeUsage(promptText: String, completionText: String, usageOverride: Option[UsageOverride]): OpenAI.Usage =
+    usageOverride match {
+      case Some(UsageOverride(promptTokens, completionTokens)) =>
+        OpenAI.Usage(promptTokens, completionTokens, promptTokens + completionTokens)
+      case None =>
+        val promptTokens     = promptText.split("\\s+").count(_.nonEmpty)
+        val completionTokens = completionText.split("\\s+").count(_.nonEmpty)
+        OpenAI.Usage(promptTokens, completionTokens, promptTokens + completionTokens)
+    }
 }
