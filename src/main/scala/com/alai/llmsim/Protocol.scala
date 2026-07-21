@@ -1,6 +1,6 @@
 package com.alai.llmsim
 
-import io.circe.{Codec, Json}
+import io.circe.{Codec, Decoder, Encoder, Json}
 import io.circe.generic.semiauto._
 
 /** Just enough of each vendor's wire shape to represent a request/response
@@ -32,6 +32,14 @@ object OpenAI {
   final case class FunctionCall(name: String, arguments: String)
   final case class ToolCall(id: String, `type`: String = "function", function: FunctionCall)
 
+  /** `content` accepts either a plain JSON string or an array of content
+    * parts (OpenAI's real API supports both -- the array form is how
+    * multimodal messages work). Only the decoder needs to be lenient;
+    * llmsim only ever decodes Message from incoming requests, it never
+    * encodes one back out (ChatResponse.choices carries its own
+    * Message, encoded via the plain derived codec below, always as a
+    * plain string since llmsim never sends multimodal content).
+    */
   final case class Message(
       role: String,
       content: Option[String] = None,
@@ -39,6 +47,27 @@ object OpenAI {
       // Set on a "tool" role message: which tool_call this is the result of.
       tool_call_id: Option[String] = None
   )
+  object Message {
+    // An array-of-parts content is flattened to the concatenation of
+    // its text parts -- enough to exercise a script's Reply/ToolCall
+    // logic, which only ever reads message text, never structured parts.
+    private val arrayContentAsString: Decoder[Option[String]] =
+      Decoder[List[Json]].map { parts =>
+        val text = parts.flatMap(_.asObject).flatMap(_("text")).flatMap(_.asString).mkString
+        if (text.isEmpty) None else Some(text)
+      }
+
+    implicit val decoder: Decoder[Message] = Decoder.instance { cursor =>
+      for {
+        role         <- cursor.downField("role").as[String]
+        content      <- cursor.downField("content").as[Option[String]]
+                           .orElse(cursor.downField("content").as[Option[String]](arrayContentAsString))
+        toolCalls    <- cursor.downField("tool_calls").as[Option[List[ToolCall]]]
+        toolCallId   <- cursor.downField("tool_call_id").as[Option[String]]
+      } yield Message(role, content, toolCalls, toolCallId)
+    }
+    implicit val encoder: Encoder[Message] = deriveEncoder
+  }
 
   final case class ChatRequest(
       model: String,
@@ -73,7 +102,6 @@ object OpenAI {
 
   implicit val functionCallCodec: Codec[FunctionCall]   = deriveCodec
   implicit val toolCallCodec: Codec[ToolCall]           = deriveCodec
-  implicit val messageCodec: Codec[Message]             = deriveCodec
   implicit val choiceCodec: Codec[Choice]               = deriveCodec
   implicit val usageCodec: Codec[Usage]                 = deriveCodec
   implicit val chatRequestCodec: Codec[ChatRequest]     = deriveCodec
@@ -106,7 +134,30 @@ object Anthropic {
       content: Option[Json] = None
   )
 
+  /** `content` accepts either a plain JSON string -- Anthropic's real API
+    * shorthand for a single text block, used by Spring AI 2.0's official
+    * Anthropic SDK when a caller does `ChatClient.prompt("hello")` -- or
+    * the full array-of-content-blocks form. llmsim only ever decodes
+    * Message (it's never part of an outgoing response body), so only
+    * the decoder needs to be lenient; the encoder stays derived normally
+    * for tests that construct request bodies directly.
+    */
   final case class Message(role: String, content: List[ContentBlock])
+  object Message {
+    private val arrayContent: Decoder[List[ContentBlock]] =
+      Decoder[List[ContentBlock]]
+    private val stringContent: Decoder[List[ContentBlock]] =
+      Decoder[String].map(text => List(ContentBlock(`type` = "text", text = Some(text))))
+
+    implicit val decoder: Decoder[Message] = Decoder.instance { cursor =>
+      for {
+        role    <- cursor.downField("role").as[String]
+        content <- cursor.downField("content").as[List[ContentBlock]](arrayContent)
+                     .orElse(cursor.downField("content").as[List[ContentBlock]](stringContent))
+      } yield Message(role, content)
+    }
+    implicit val encoder: Encoder[Message] = deriveEncoder
+  }
 
   final case class MessagesRequest(
       model: String,
@@ -131,7 +182,6 @@ object Anthropic {
   final case class ErrorBody(`type`: String = "error", error: ErrorDetail)
 
   implicit val contentBlockCodec: Codec[ContentBlock]         = deriveCodec
-  implicit val messageCodec: Codec[Message]                   = deriveCodec
   implicit val usageCodec: Codec[Usage]                       = deriveCodec
   implicit val messagesRequestCodec: Codec[MessagesRequest]   = deriveCodec
   implicit val messagesResponseCodec: Codec[MessagesResponse] = deriveCodec
