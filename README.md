@@ -454,14 +454,30 @@ docs rather than making a live call.
 1. ~~Single canned response~~ — done
 2. ~~Scriptable responses~~ — done
 3. ~~Captured-call journal~~ — done (`/_llmsim/calls`, `/_llmsim/status`, `/_llmsim/reset`)
-4. ~~Tool-call round trips~~ — done (`toolCall`, and `replyFromToolResult`
-   to build a reply from the app's real tool result rather than a fixed string)
-5. ~~Published, reusable distribution~~ — done (`ghcr.io/pramalin/llmsim-build`
-   as a dependency for consuming projects, `ghcr.io/pramalin/llmsim` standalone)
-6. Streaming responses (SSE)
-7. Fault injection: artificial latency, HTTP failure variety beyond fixed
-   status/message, truncated streams
-8. Per-provider or per-test-run session isolation, so concurrent tests
-   don't share one script position (currently global to the process)
-9. `GET /v1/models`, token-usage refinements, execution trace / timeline
-   view over the call journal
+4. ~~Tool-call round trips~~ — done (`toolCall`, and `replyFromToolResult` to build a reply from the app's real tool result rather than a fixed string)
+5. ~~Published, reusable distribution~~ — done (`ghcr.io/pramalin/llmsim-build` as a dependency for consuming projects, `ghcr.io/pramalin/llmsim` standalone)
+
+6. **Simple enhancements** — no UI dependency, no streaming dependency, ships as one commit ahead of everything below:
+   - Duration and correlation fields on `CapturedCall`: `receivedAtEpochMillis` / `completedAtEpochMillis` (with a derived `durationMillis`), plus a `sessionId` field.
+   - Per-test-run session isolation, keyed by an `X-LLMSIM-SESSION` request header, so concurrent tests don't share one script position (currently global to the process).
+
+   These two are bundled into one step because they touch the same `CapturedCall`/`ScriptRunner` surface — doing them together avoids changing that schema twice. This is deliberately sequenced *before* streaming (item 10): streaming introduces its own mutable per-call state (stream position, disconnect/fault status), and isolating that per-session is materially harder to retrofit after the fact than to design in from the start.
+
+7. **Plan and scope a sample Spring AI verification module** — a design pass, no code yet: what it proves at this stage (a real Spring AI `ChatClient` call and a tool-call round trip against llmsim's *current*, non-streaming capabilities), where it lives (`ci/spring-verification/`, alongside the existing `ci/smoke-test/`), what it deliberately excludes (no MCP, no tool execution beyond what `ToolCallFlow` already covers, no UI), and how it's gated in CI. Written up as its own short doc so the scope is agreed before any code exists.
+
+8. **Build the sample app per that scope** — a minimal Spring Boot + Gradle module implementing exactly what item 7 scoped: proof that a real Spring AI client can talk to llmsim correctly, on today's non-streaming wire format. Wired into `.github/workflows/publish.yml` as a release gate alongside the existing smoke test.
+
+9. **Cut a release** — tags a version shipping items 6–8: the `CapturedCall` fields, session isolation, updated docs, and the sample verification module (still non-streaming). This is a real, usable release on its own — none of it depends on SSE existing.
+
+10. **Streaming responses (SSE)** — a new release cycle starting fresh from item 9's tag, for both OpenAI- and Anthropic-shaped endpoints, enough of each vendor's real wire format to exercise Spring AI's `ChatClient` `Flux<String>` / `Flux<ChatResponse>` streaming paths.
+
+    **Definition of done extends the item 7/8 sample module rather than creating a new one.** llmsim can assert that it *sent* well-formed SSE; it can't assert that a real Spring AI `ChatClient` *parsed* it correctly. Since the sample module and its CI gate already exist by this point (items 7–9), this step adds streaming test cases to it — normal token-by-token streaming completing cleanly, a mid-stream disconnect surfacing as the correct exception, a tool call's arguments reassembling correctly — rather than standing up a second verification harness. No other repository needs to exist or build for this item to be considered done.
+
+11. Bare-bones dashboard — plain JSON endpoints (`GET /_llmsim/dashboard`, `GET /_llmsim/sessions`) rendered by a single static HTML page served alongside the API, no build step or framework. Makes sessions, call outcomes, and latency visible while streaming and fault injection are still being iterated on — not a final UI, and not a substitute for item 10's real-client verification.
+12. Streaming fault injection: delayed first token, delayed inter-token gaps, mid-stream disconnect, malformed SSE event, stream ending without a completion event, tool-call arguments split across chunks, and HTTP 429 before streaming begins. Validated against the item 11 dashboard as each fault type is added, and extend the sample module (item 10) to cover the fault types that matter most for a real client (mid-stream disconnect, split tool-call arguments).
+13. `GET /v1/models`, token-usage refinements.
+14. The real Angular console (`console-angular/`), served by the standalone image at `/_llmsim/ui`, with overview/calls/timeline/sessions/streaming views as designed. Deliberately last — the data model (sessions, streams, faults) needs to be settled first so the UI is built once against a stable shape instead of reworked mid-flight.
+
+`agentic-analytics` remains a pure downstream consumer throughout all of the above — it always pins a released `llmsim-build` tag (never a dev build), the same as any other project building on llmsim.
+
+Downstream work that depends on this roadmap — `agentic-analytics` end-to-end streaming and its own deterministic regression suite, and the Spring AI + Playwright MCP UI-testing agent — lives in those projects' own planning docs, not here, since llmsim's roadmap should only track what ships inside this repo.
