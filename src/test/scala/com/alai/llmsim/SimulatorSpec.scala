@@ -11,6 +11,7 @@ import org.scalatest.freespec.AsyncFreeSpec
 import org.scalatest.matchers.should.Matchers
 import io.circe.{Decoder, Json}
 import io.circe.generic.semiauto.deriveDecoder
+import io.circe.parser.{parse => parseJson}
 
 import Script._
 
@@ -46,12 +47,36 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
     Request[IO](Method.POST, uri"/v1/chat/completions")
       .withEntity(OpenAI.ChatRequest("gpt-4o-mini", List(OpenAI.Message("user", Some(text)))))
 
+  private def openAIStreamingRequest(text: String = "hi"): Request[IO] =
+    Request[IO](Method.POST, uri"/v1/chat/completions")
+      .withEntity(OpenAI.ChatRequest("gpt-4o-mini", List(OpenAI.Message("user", Some(text))), stream = Some(true)))
+
   private def anthropicRequest(text: String = "hi"): Request[IO] =
     Request[IO](Method.POST, uri"/v1/messages")
       .withEntity(Anthropic.MessagesRequest(
         "claude-sonnet-5", 256,
         List(Anthropic.Message("user", List(Anthropic.ContentBlock("text", Some(text)))))
       ))
+
+  private def anthropicStreamingRequest(text: String = "hi"): Request[IO] =
+    Request[IO](Method.POST, uri"/v1/messages")
+      .withEntity(Anthropic.MessagesRequest(
+        "claude-sonnet-5", 256,
+        List(Anthropic.Message("user", List(Anthropic.ContentBlock("text", Some(text))))),
+        stream = Some(true)
+      ))
+
+  // Splits a raw SSE body on the blank-line frame separator and parses
+  // each frame's optional "event:" line and required "data:" line. Used
+  // to assert on the actual wire framing, not just typed response
+  // decoding -- that framing is exactly what a real client parses.
+  private def parseFrames(body: String): List[(Option[String], String)] =
+    body.split("\n\n").filter(_.nonEmpty).toList.map { frame =>
+      val lines     = frame.linesIterator.toList
+      val eventLine = lines.collectFirst { case l if l.startsWith("event: ") => l.stripPrefix("event: ") }
+      val dataLine  = lines.collectFirst { case l if l.startsWith("data: ") => l.stripPrefix("data: ") }.getOrElse("")
+      (eventLine, dataLine)
+    }
 
   "a script's replies are consumed in order, per call" in {
     for {
@@ -496,6 +521,146 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
         // Not "helloworld" -- see Protocol.scala's arrayContentAsString.
         calls.head.messages.head.content shouldBe "hello world"
       }
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // SSE streaming (roadmap item 12). MVP: whole units per chunk (a whole
+  // word, a whole tool call) -- see Simulator.scala's wordChunks and the
+  // MVP comments on the streaming Protocol shapes for why finer-grained
+  // splitting is deliberately deferred to fault injection (item 14). A
+  // real Spring AI client's ability to actually parse this is checked
+  // separately, in ci/spring-verification -- these are the authoritative
+  // tests for what llmsim actually puts on the wire.
+  // ---------------------------------------------------------------------
+
+  "OpenAI SSE streaming" - {
+
+    "a Reply step streams as data-only chunks, reconstructing the full text, terminated by [DONE]" in {
+      for {
+        c        <- clientFor(Script.exactly(reply("hello there world")))
+        response <- c.run(openAIStreamingRequest()).use { resp =>
+                      resp.headers.get(org.typelevel.ci.CIString("Content-Type")).map(_.head.value) shouldBe
+                        Some("text/event-stream; charset=utf-8")
+                      resp.bodyText.compile.string
+                    }
+        frames = parseFrames(response)
+      } yield {
+        frames.last._2 shouldBe "[DONE]"
+        val reconstructed = frames.init.flatMap { case (_, data) =>
+          parseJson(data).toOption.flatMap(_.hcursor.downField("choices").downArray
+            .downField("delta").downField("content").as[String].toOption)
+        }.mkString
+        reconstructed shouldBe "hello there world"
+      }
+    }
+
+    "a ToolCall step streams the tool call in one chunk, ending with finish_reason tool_calls" in {
+      for {
+        c        <- clientFor(Script.exactly(toolCall(id = "call-1", name = "get_weather", arguments = """{"city":"SF"}""")))
+        response <- c.expect[String](openAIStreamingRequest("what's the weather?"))
+        frames = parseFrames(response)
+      } yield {
+        frames.last._2 shouldBe "[DONE]"
+        val toolCallChunk = frames.init.map(_._2).flatMap(parseJson(_).toOption).find { j =>
+          // .downField alone isn't enough: circe's derived encoder writes
+          // an absent Option as explicit `"tool_calls": null`, not an
+          // omitted key, so the field "exists" on every chunk. .downArray
+          // actually tries to enter it, which only succeeds on the one
+          // chunk where it's a real (non-null) array.
+          j.hcursor.downField("choices").downArray.downField("delta").downField("tool_calls").downArray.succeeded
+        }.get
+        val fn = toolCallChunk.hcursor.downField("choices").downArray.downField("delta")
+          .downField("tool_calls").downArray.downField("function")
+        fn.downField("name").as[String] shouldBe Right("get_weather")
+        fn.downField("arguments").as[String] shouldBe Right("""{"city":"SF"}""")
+
+        val lastChunk = frames.init.last._2
+        parseJson(lastChunk).toOption.get.hcursor
+          .downField("choices").downArray.downField("finish_reason").as[String] shouldBe Right("tool_calls")
+      }
+    }
+
+    "the journal records a streamed call with streamed=true and the same aggregate body shape a non-streaming call would get" in {
+      for {
+        c     <- clientFor(Script.exactly(reply("hi")))
+        _     <- c.expect[String](openAIStreamingRequest())
+        calls <- c.expect[List[CapturedCall]](Request[IO](Method.GET, uri"/_llmsim/calls"))
+      } yield {
+        calls.head.streamed shouldBe true
+        calls.head.outcome match {
+          case CallOutcome.Responded(200, body) =>
+            body.hcursor.downField("choices").downArray.downField("message").downField("content").as[String] shouldBe Right("hi")
+          case other => fail(s"expected Responded, got $other")
+        }
+      }
+    }
+
+    "a script's headers still apply to a streamed response" in {
+      for {
+        c    <- clientFor(Script.exactly(reply("hi", headers = Map("x-ratelimit-remaining-requests" -> "59"))))
+        resp <- c.run(openAIStreamingRequest()).use(r => IO.pure(r.headers))
+      } yield resp.get(org.typelevel.ci.CIString("x-ratelimit-remaining-requests")).map(_.head.value) shouldBe Some("59")
+    }
+
+    "the same script step still answers non-streaming when stream isn't set" in {
+      for {
+        c        <- clientFor(Script.exactly(reply("hello there world")))
+        response <- c.expect[OpenAI.ChatResponse](openAIRequest())
+      } yield response.choices.head.message.content shouldBe Some("hello there world")
+    }
+  }
+
+  "Anthropic SSE streaming" - {
+
+    "a Reply step emits message_start .. message_stop, reconstructing the reply from content_block_delta text" in {
+      for {
+        c        <- clientFor(Script.exactly(reply("hello there world")))
+        response <- c.expect[String](anthropicStreamingRequest())
+        frames = parseFrames(response)
+      } yield {
+        frames.map(_._1) shouldBe List(
+          Some("message_start"), Some("content_block_start"),
+          Some("content_block_delta"), Some("content_block_delta"), Some("content_block_delta"),
+          Some("content_block_stop"), Some("message_delta"), Some("message_stop")
+        )
+        val reconstructed = frames.collect { case (Some("content_block_delta"), data) =>
+          parseJson(data).toOption.flatMap(_.hcursor.downField("delta").downField("text").as[String].toOption)
+        }.flatten.mkString
+        reconstructed shouldBe "hello there world"
+      }
+    }
+
+    "a ToolCall step streams tool_use via a single input_json_delta carrying the full arguments" in {
+      for {
+        c        <- clientFor(Script.exactly(toolCall(id = "call-1", name = "get_weather", arguments = """{"city":"SF"}""")))
+        response <- c.expect[String](anthropicStreamingRequest("what's the weather?"))
+        frames = parseFrames(response)
+      } yield {
+        val delta = frames.collectFirst { case (Some("content_block_delta"), data) => data }.get
+        val json  = parseJson(delta).toOption.get
+        json.hcursor.downField("delta").downField("type").as[String] shouldBe Right("input_json_delta")
+        json.hcursor.downField("delta").downField("partial_json").as[String] shouldBe Right("""{"city":"SF"}""")
+
+        val messageDelta = frames.collectFirst { case (Some("message_delta"), data) => data }.get
+        parseJson(messageDelta).toOption.get.hcursor
+          .downField("delta").downField("stop_reason").as[String] shouldBe Right("tool_use")
+      }
+    }
+
+    "the journal records a streamed call with streamed=true" in {
+      for {
+        c     <- clientFor(Script.exactly(reply("hi")))
+        _     <- c.expect[String](anthropicStreamingRequest())
+        calls <- c.expect[List[CapturedCall]](Request[IO](Method.GET, uri"/_llmsim/calls"))
+      } yield calls.head.streamed shouldBe true
+    }
+
+    "the same script step still answers non-streaming when stream isn't set" in {
+      for {
+        c        <- clientFor(Script.exactly(reply("hello there world")))
+        response <- c.expect[Anthropic.MessagesResponse](anthropicRequest())
+      } yield response.content.head.text shouldBe Some("hello there world")
     }
   }
 }

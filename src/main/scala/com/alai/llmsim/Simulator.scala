@@ -2,6 +2,7 @@ package com.alai.llmsim
 
 import cats.effect.{Clock, IO}
 import cats.syntax.all._
+import fs2.Stream
 import org.http4s._
 import org.http4s.dsl.io._
 import org.http4s.circe._
@@ -61,7 +62,8 @@ object Simulator {
         stepIndex: Option[Int],
         receivedAt: FiniteDuration,
         startedAt: FiniteDuration,
-        responseHeaders: Map[String, String] = Map.empty
+        responseHeaders: Map[String, String] = Map.empty,
+        streamed: Boolean = false
     ): IO[CapturedCall] =
       for {
         finishedAt  <- Clock[IO].monotonic
@@ -69,7 +71,8 @@ object Simulator {
         call        <- journal.record(
                           provider, model, messages, rawRequest, outcome, stepIndex,
                           receivedAt.toMillis, completedAt.toMillis, (finishedAt - startedAt).toMillis,
-                          responseHeaders.map { case (k, v) => CapturedHeader(k, v) }.toVector
+                          responseHeaders.map { case (k, v) => CapturedHeader(k, v) }.toVector,
+                          streamed
                         )
       } yield call
 
@@ -108,6 +111,34 @@ object Simulator {
                         for {
                           outcome <- runner.next
                           result  <- outcome match {
+                                       case NextStep.Answer(Step.Reply(text, usageOverride, headers), idx) if body.stream.contains(true) =>
+                                         val chatId  = s"chatcmpl-sim-${UUID.randomUUID()}"
+                                         val created = Instant.now().getEpochSecond
+                                         def chunk(delta: OpenAI.Delta, finish: Option[String]): Json =
+                                           OpenAI.ChatCompletionChunk(chatId, created = created, model = body.model,
+                                             choices = List(OpenAI.ChunkChoice(0, delta, finish))).asJson
+
+                                         val roleChunk     = chunk(OpenAI.Delta(role = Some("assistant")), None)
+                                         val contentChunks = wordChunks(text).map(piece => chunk(OpenAI.Delta(content = Some(piece)), None))
+                                         val finalChunk    = chunk(OpenAI.Delta(), Some("stop"))
+
+                                         val frames = Stream.emits(roleChunk :: contentChunks ::: List(finalChunk))
+                                           .map(j => sseFrame(None, j)) ++ Stream.emit("data: [DONE]\n\n")
+
+                                         // Same aggregate response shape a non-streaming call would have
+                                         // logged -- only `streamed` distinguishes transport in the journal.
+                                         val aggregate = OpenAI.ChatResponse(
+                                           id = chatId, created = created, model = body.model,
+                                           choices = List(OpenAI.Choice(0, OpenAI.Message(role = "assistant", content = Some(text)), "stop")),
+                                           usage = fakeUsage(openAIPromptText(body), text, usageOverride)
+                                         ).asJson
+
+                                         for {
+                                           _        <- recordTimed("openai", model, messages, json,
+                                                          CallOutcome.Responded(200, aggregate), Some(idx), receivedAt, startedAt, headers, streamed = true)
+                                           response <- sseResponse(frames, headers)
+                                         } yield response
+
                                        case NextStep.Answer(Step.Reply(text, usageOverride, headers), idx) =>
                                          val response = OpenAI.ChatResponse(
                                            id = s"chatcmpl-sim-${UUID.randomUUID()}",
@@ -128,6 +159,39 @@ object Simulator {
                                                         CallOutcome.Responded(200, responseJson), Some(idx), receivedAt, startedAt, headers)
                                            result <- withHeaders(Ok(responseJson), headers)
                                          } yield result
+
+                                       case NextStep.Answer(Step.ToolCall(id, name, arguments, usageOverride, headers), idx) if body.stream.contains(true) =>
+                                         val chatId  = s"chatcmpl-sim-${UUID.randomUUID()}"
+                                         val created = Instant.now().getEpochSecond
+                                         def chunk(delta: OpenAI.Delta, finish: Option[String]): Json =
+                                           OpenAI.ChatCompletionChunk(chatId, created = created, model = body.model,
+                                             choices = List(OpenAI.ChunkChoice(0, delta, finish))).asJson
+
+                                         val roleChunk = chunk(OpenAI.Delta(role = Some("assistant")), None)
+                                         val toolChunk = chunk(
+                                           OpenAI.Delta(tool_calls = Some(List(
+                                             OpenAI.ChunkToolCall(index = 0, id = Some(id), `type` = Some("function"),
+                                               function = Some(OpenAI.ChunkFunctionCall(Some(name), Some(arguments))))
+                                           ))), None)
+                                         val finalChunk = chunk(OpenAI.Delta(), Some("tool_calls"))
+
+                                         val frames = Stream.emits(List(roleChunk, toolChunk, finalChunk))
+                                           .map(j => sseFrame(None, j)) ++ Stream.emit("data: [DONE]\n\n")
+
+                                         val aggregate = OpenAI.ChatResponse(
+                                           id = chatId, created = created, model = body.model,
+                                           choices = List(OpenAI.Choice(0,
+                                             OpenAI.Message(role = "assistant", content = None,
+                                               tool_calls = Some(List(OpenAI.ToolCall(id, "function", OpenAI.FunctionCall(name, arguments))))),
+                                             "tool_calls")),
+                                           usage = fakeUsage(openAIPromptText(body), s"$name($arguments)", usageOverride)
+                                         ).asJson
+
+                                         for {
+                                           _        <- recordTimed("openai", model, messages, json,
+                                                          CallOutcome.Responded(200, aggregate), Some(idx), receivedAt, startedAt, headers, streamed = true)
+                                           response <- sseResponse(frames, headers)
+                                         } yield response
 
                                        case NextStep.Answer(Step.ToolCall(id, name, arguments, usageOverride, headers), idx) =>
                                          val response = OpenAI.ChatResponse(
@@ -167,6 +231,33 @@ object Simulator {
                                                             CallOutcome.Failed(message), Some(idx), receivedAt, startedAt)
                                                result <- errorResponse(500, errorJson)
                                              } yield result
+
+                                           case Some(resultText) if body.stream.contains(true) =>
+                                             val text    = render(resultText)
+                                             val chatId  = s"chatcmpl-sim-${UUID.randomUUID()}"
+                                             val created = Instant.now().getEpochSecond
+                                             def chunk(delta: OpenAI.Delta, finish: Option[String]): Json =
+                                               OpenAI.ChatCompletionChunk(chatId, created = created, model = body.model,
+                                                 choices = List(OpenAI.ChunkChoice(0, delta, finish))).asJson
+
+                                             val roleChunk     = chunk(OpenAI.Delta(role = Some("assistant")), None)
+                                             val contentChunks = wordChunks(text).map(piece => chunk(OpenAI.Delta(content = Some(piece)), None))
+                                             val finalChunk    = chunk(OpenAI.Delta(), Some("stop"))
+
+                                             val frames = Stream.emits(roleChunk :: contentChunks ::: List(finalChunk))
+                                               .map(j => sseFrame(None, j)) ++ Stream.emit("data: [DONE]\n\n")
+
+                                             val aggregate = OpenAI.ChatResponse(
+                                               id = chatId, created = created, model = body.model,
+                                               choices = List(OpenAI.Choice(0, OpenAI.Message(role = "assistant", content = Some(text)), "stop")),
+                                               usage = fakeUsage(openAIPromptText(body), text, usageOverride)
+                                             ).asJson
+
+                                             for {
+                                               _        <- recordTimed("openai", model, messages, json,
+                                                              CallOutcome.Responded(200, aggregate), Some(idx), receivedAt, startedAt, headers, streamed = true)
+                                               response <- sseResponse(frames, headers)
+                                             } yield response
 
                                            case Some(resultText) =>
                                              val text = render(resultText)
@@ -229,6 +320,46 @@ object Simulator {
                         for {
                           outcome <- runner.next
                           result  <- outcome match {
+                                       case NextStep.Answer(Step.Reply(text, usageOverride, headers), idx) if body.stream.contains(true) =>
+                                         val msgId = s"msg-sim-${UUID.randomUUID()}"
+                                         val usage = anthropicUsage(anthropicPromptText(body), text, usageOverride)
+
+                                         val messageStart = Anthropic.MessageStartPayload(
+                                           message = Anthropic.MessageStartMessage(
+                                             id = msgId, model = body.model, stop_reason = None,
+                                             usage = Anthropic.StreamUsage(Some(usage.input_tokens), Some(0))
+                                           )
+                                         ).asJson
+                                         val blockStart = Anthropic.ContentBlockStartPayload(
+                                           index = 0, content_block = Anthropic.ContentBlock(`type` = "text", text = Some(""))
+                                         ).asJson
+                                         val textDeltas = wordChunks(text).map(piece =>
+                                           Anthropic.ContentBlockDeltaPayload(index = 0, delta = Anthropic.TextDelta(text = piece).asJson).asJson)
+                                         val blockStop = Anthropic.ContentBlockStopPayload(index = 0).asJson
+                                         val messageDelta = Anthropic.MessageDeltaPayload(
+                                           delta = Anthropic.MessageDeltaInner(stop_reason = "end_turn"),
+                                           usage = Anthropic.StreamUsage(None, Some(usage.output_tokens))
+                                         ).asJson
+                                         val messageStop = Anthropic.MessageStopPayload().asJson
+
+                                         val events: List[(String, Json)] =
+                                           ("message_start", messageStart) :: ("content_block_start", blockStart) ::
+                                             textDeltas.map(d => ("content_block_delta", d)) :::
+                                             List(("content_block_stop", blockStop), ("message_delta", messageDelta), ("message_stop", messageStop))
+
+                                         val frames = Stream.emits(events).map { case (ev, j) => sseFrame(Some(ev), j) }
+
+                                         val aggregate = Anthropic.MessagesResponse(
+                                           id = msgId, content = List(Anthropic.ContentBlock(`type` = "text", text = Some(text))),
+                                           model = body.model, stop_reason = "end_turn", usage = usage
+                                         ).asJson
+
+                                         for {
+                                           _        <- recordTimed("anthropic", model, messages, json,
+                                                          CallOutcome.Responded(200, aggregate), Some(idx), receivedAt, startedAt, headers, streamed = true)
+                                           response <- sseResponse(frames, headers)
+                                         } yield response
+
                                        case NextStep.Answer(Step.Reply(text, usageOverride, headers), idx) =>
                                          val response = Anthropic.MessagesResponse(
                                            id = s"msg-sim-${UUID.randomUUID()}",
@@ -260,6 +391,49 @@ object Simulator {
                                                result <- errorResponse(500, errorJson)
                                              } yield result
 
+                                           case Right(inputJson) if body.stream.contains(true) =>
+                                             val msgId = s"msg-sim-${UUID.randomUUID()}"
+                                             val usage = anthropicUsage(anthropicPromptText(body), s"$name(${inputJson.noSpaces})", usageOverride)
+
+                                             val messageStart = Anthropic.MessageStartPayload(
+                                               message = Anthropic.MessageStartMessage(
+                                                 id = msgId, model = body.model, stop_reason = None,
+                                                 usage = Anthropic.StreamUsage(Some(usage.input_tokens), Some(0))
+                                               )
+                                             ).asJson
+                                             val blockStart = Anthropic.ContentBlockStartPayload(
+                                               index = 0,
+                                               content_block = Anthropic.ContentBlock(`type` = "tool_use", id = Some(id), name = Some(name), input = Some(Json.obj()))
+                                             ).asJson
+                                             val inputDelta = Anthropic.ContentBlockDeltaPayload(
+                                               index = 0, delta = Anthropic.InputJsonDelta(partial_json = inputJson.noSpaces).asJson
+                                             ).asJson
+                                             val blockStop = Anthropic.ContentBlockStopPayload(index = 0).asJson
+                                             val messageDelta = Anthropic.MessageDeltaPayload(
+                                               delta = Anthropic.MessageDeltaInner(stop_reason = "tool_use"),
+                                               usage = Anthropic.StreamUsage(None, Some(usage.output_tokens))
+                                             ).asJson
+                                             val messageStop = Anthropic.MessageStopPayload().asJson
+
+                                             val events: List[(String, Json)] = List(
+                                               ("message_start", messageStart), ("content_block_start", blockStart),
+                                               ("content_block_delta", inputDelta), ("content_block_stop", blockStop),
+                                               ("message_delta", messageDelta), ("message_stop", messageStop)
+                                             )
+                                             val frames = Stream.emits(events).map { case (ev, j) => sseFrame(Some(ev), j) }
+
+                                             val aggregate = Anthropic.MessagesResponse(
+                                               id = msgId,
+                                               content = List(Anthropic.ContentBlock(`type` = "tool_use", id = Some(id), name = Some(name), input = Some(inputJson))),
+                                               model = body.model, stop_reason = "tool_use", usage = usage
+                                             ).asJson
+
+                                             for {
+                                               _        <- recordTimed("anthropic", model, messages, json,
+                                                              CallOutcome.Responded(200, aggregate), Some(idx), receivedAt, startedAt, headers, streamed = true)
+                                               response <- sseResponse(frames, headers)
+                                             } yield response
+
                                            case Right(inputJson) =>
                                              val response = Anthropic.MessagesResponse(
                                                id = s"msg-sim-${UUID.randomUUID()}",
@@ -289,6 +463,47 @@ object Simulator {
                                                             CallOutcome.Failed(message), Some(idx), receivedAt, startedAt)
                                                result <- errorResponse(500, errorJson)
                                              } yield result
+
+                                           case Some(resultText) if body.stream.contains(true) =>
+                                             val text  = render(resultText)
+                                             val msgId = s"msg-sim-${UUID.randomUUID()}"
+                                             val usage = anthropicUsage(anthropicPromptText(body), text, usageOverride)
+
+                                             val messageStart = Anthropic.MessageStartPayload(
+                                               message = Anthropic.MessageStartMessage(
+                                                 id = msgId, model = body.model, stop_reason = None,
+                                                 usage = Anthropic.StreamUsage(Some(usage.input_tokens), Some(0))
+                                               )
+                                             ).asJson
+                                             val blockStart = Anthropic.ContentBlockStartPayload(
+                                               index = 0, content_block = Anthropic.ContentBlock(`type` = "text", text = Some(""))
+                                             ).asJson
+                                             val textDeltas = wordChunks(text).map(piece =>
+                                               Anthropic.ContentBlockDeltaPayload(index = 0, delta = Anthropic.TextDelta(text = piece).asJson).asJson)
+                                             val blockStop = Anthropic.ContentBlockStopPayload(index = 0).asJson
+                                             val messageDelta = Anthropic.MessageDeltaPayload(
+                                               delta = Anthropic.MessageDeltaInner(stop_reason = "end_turn"),
+                                               usage = Anthropic.StreamUsage(None, Some(usage.output_tokens))
+                                             ).asJson
+                                             val messageStop = Anthropic.MessageStopPayload().asJson
+
+                                             val events: List[(String, Json)] =
+                                               ("message_start", messageStart) :: ("content_block_start", blockStart) ::
+                                                 textDeltas.map(d => ("content_block_delta", d)) :::
+                                                 List(("content_block_stop", blockStop), ("message_delta", messageDelta), ("message_stop", messageStop))
+
+                                             val frames = Stream.emits(events).map { case (ev, j) => sseFrame(Some(ev), j) }
+
+                                             val aggregate = Anthropic.MessagesResponse(
+                                               id = msgId, content = List(Anthropic.ContentBlock(`type` = "text", text = Some(text))),
+                                               model = body.model, stop_reason = "end_turn", usage = usage
+                                             ).asJson
+
+                                             for {
+                                               _        <- recordTimed("anthropic", model, messages, json,
+                                                              CallOutcome.Responded(200, aggregate), Some(idx), receivedAt, startedAt, headers, streamed = true)
+                                               response <- sseResponse(frames, headers)
+                                             } yield response
 
                                            case Some(resultText) =>
                                              val text = render(resultText)
@@ -421,6 +636,46 @@ object Simulator {
     else response.map { r =>
       headers.foldLeft(r) { case (resp, (k, v)) => resp.putHeaders(Header.Raw(CIString(k), v)) }
     }
+
+  // ---------------------------------------------------------------------
+  // SSE plumbing. Built by hand (raw "event: ...\ndata: ...\n\n" strings)
+  // rather than through http4s's ServerSentEvent helper type, so this
+  // doesn't depend on exactly which package that type/encoder lives
+  // under in this http4s version.
+  //
+  // Content-Type, Cache-Control, and X-Accel-Buffering are set
+  // explicitly: the last one is a defensive no-op against llmsim's own
+  // server (Ember doesn't buffer SSE responses), but matters the moment
+  // llmsim sits behind an Nginx-shaped proxy in someone's test
+  // environment.
+  // ---------------------------------------------------------------------
+
+  private def sseFrame(event: Option[String], data: Json): String = {
+    val eventLine = event.map(e => s"event: $e\n").getOrElse("")
+    s"$eventLine" + s"data: ${data.noSpaces}\n\n"
+  }
+
+  private def sseResponse(frames: Stream[IO, String], headers: Map[String, String]): IO[Response[IO]] =
+    withHeaders(
+      Response[IO](Status.Ok)
+        .putHeaders(
+          Header.Raw(CIString("Content-Type"), "text/event-stream; charset=utf-8"),
+          Header.Raw(CIString("Cache-Control"), "no-cache"),
+          Header.Raw(CIString("X-Accel-Buffering"), "no")
+        )
+        .withBodyStream(frames.through(fs2.text.utf8.encode))
+        .pure[IO],
+      headers
+    )
+
+  // A chunk-by-word split is a stand-in for real token boundaries --
+  // good enough to exercise a client's incremental-append handling
+  // without needing a real tokenizer. Fault injection (roadmap item 14)
+  // is where finer-grained or deliberately-odd chunking becomes a
+  // script's explicit choice; MVP always sends one complete word per
+  // chunk.
+  private def wordChunks(text: String): List[String] =
+    text.split(" ").toList.zipWithIndex.map { case (w, i) => if (i == 0) w else s" $w" }
 
   // A script-provided UsageOverride is used verbatim when present -- for
   // testing behavior at a specific token count precisely (a budget check,

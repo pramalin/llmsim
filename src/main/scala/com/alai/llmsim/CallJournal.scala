@@ -91,7 +91,14 @@ final case class CapturedCall(
     // synthetic llmsim-internal error where the step's own headers
     // don't apply -- see Simulator.scala's recordTimed call sites for
     // which branches populate this).
-    responseHeaders: Vector[CapturedHeader] = Vector.empty
+    responseHeaders: Vector[CapturedHeader] = Vector.empty,
+    // True if this call was answered as SSE (request had "stream": true
+    // and got a text/event-stream response). outcome.body still records
+    // the same logical response shape a non-streaming call would have
+    // gotten -- see Simulator.scala's streaming branches -- this flag
+    // is the only thing that tells a reader which transport was
+    // actually used.
+    streamed: Boolean = false
 )
 
 trait CallJournal {
@@ -105,7 +112,8 @@ trait CallJournal {
       receivedAtEpochMillis: Long,
       completedAtEpochMillis: Long,
       durationMillis: Long,
-      responseHeaders: Vector[CapturedHeader] = Vector.empty
+      responseHeaders: Vector[CapturedHeader] = Vector.empty,
+      streamed: Boolean = false
   ): IO[CapturedCall]
 
   def all: IO[List[CapturedCall]]
@@ -148,12 +156,13 @@ object CallJournal {
             receivedAtEpochMillis: Long,
             completedAtEpochMillis: Long,
             durationMillis: Long,
-            responseHeaders: Vector[CapturedHeader] = Vector.empty
+            responseHeaders: Vector[CapturedHeader] = Vector.empty,
+            streamed: Boolean = false
         ): IO[CapturedCall] =
           stateRef.modify { state =>
             val call = CapturedCall(
               state.nextSequence, provider, model, messages, rawRequest, outcome, stepIndex,
-              receivedAtEpochMillis, completedAtEpochMillis, durationMillis, responseHeaders
+              receivedAtEpochMillis, completedAtEpochMillis, durationMillis, responseHeaders, streamed
             )
             val retained = (state.calls :+ call).takeRight(maxEntries)
             JournalState(state.nextSequence + 1, retained) -> call

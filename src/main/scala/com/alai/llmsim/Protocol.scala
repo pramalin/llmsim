@@ -77,7 +77,8 @@ object OpenAI {
       model: String,
       messages: List[Message],
       temperature: Option[Double] = None,
-      max_tokens: Option[Int] = None
+      max_tokens: Option[Int] = None,
+      stream: Option[Boolean] = None
   )
 
   final case class Choice(
@@ -104,6 +105,42 @@ object OpenAI {
   final case class ErrorDetail(message: String, `type`: String = "simulated_error")
   final case class ErrorBody(error: ErrorDetail)
 
+  /** Streaming (SSE) chunk shapes -- one JSON object per `data:` line,
+    * matching OpenAI's `chat.completion.chunk` wire format.
+    *
+    * MVP: each chunk carries a COMPLETE unit (a whole word of content,
+    * or a whole tool call's name+arguments) rather than splitting a
+    * single word or a tool call's arguments across many chunks the way
+    * a real model sometimes does -- that finer-grained splitting is
+    * deliberately deferred to fault injection (roadmap item 14, "tool
+    * call arguments split across chunks"), where it's something a
+    * script opts into, not the default streaming behavior. Scripted
+    * `usage` is also not reflected in streaming responses yet -- real
+    * OpenAI only includes usage in a stream when the request sets
+    * `stream_options: {include_usage: true}`, which llmsim doesn't yet
+    * read; deferred, not forgotten.
+    */
+  final case class ChunkFunctionCall(name: Option[String] = None, arguments: Option[String] = None)
+  final case class ChunkToolCall(
+      index: Int,
+      id: Option[String] = None,
+      `type`: Option[String] = None,
+      function: Option[ChunkFunctionCall] = None
+  )
+  final case class Delta(
+      role: Option[String] = None,
+      content: Option[String] = None,
+      tool_calls: Option[List[ChunkToolCall]] = None
+  )
+  final case class ChunkChoice(index: Int, delta: Delta, finish_reason: Option[String] = None)
+  final case class ChatCompletionChunk(
+      id: String,
+      `object`: String = "chat.completion.chunk",
+      created: Long,
+      model: String,
+      choices: List[ChunkChoice]
+  )
+
   implicit val functionCallCodec: Codec[FunctionCall]   = deriveCodec
   implicit val toolCallCodec: Codec[ToolCall]           = deriveCodec
   implicit val choiceCodec: Codec[Choice]               = deriveCodec
@@ -112,6 +149,11 @@ object OpenAI {
   implicit val chatResponseCodec: Codec[ChatResponse]   = deriveCodec
   implicit val errorDetailCodec: Codec[ErrorDetail]     = deriveCodec
   implicit val errorBodyCodec: Codec[ErrorBody]         = deriveCodec
+  implicit val chunkFunctionCallCodec: Codec[ChunkFunctionCall]     = deriveCodec
+  implicit val chunkToolCallCodec: Codec[ChunkToolCall]             = deriveCodec
+  implicit val deltaCodec: Codec[Delta]                             = deriveCodec
+  implicit val chunkChoiceCodec: Codec[ChunkChoice]                 = deriveCodec
+  implicit val chatCompletionChunkCodec: Codec[ChatCompletionChunk] = deriveCodec
 }
 
 object Anthropic {
@@ -167,7 +209,8 @@ object Anthropic {
       model: String,
       max_tokens: Int,
       messages: List[Message],
-      system: Option[String] = None
+      system: Option[String] = None,
+      stream: Option[Boolean] = None
   )
 
   final case class Usage(input_tokens: Int, output_tokens: Int)
@@ -185,10 +228,60 @@ object Anthropic {
   final case class ErrorDetail(`type`: String, message: String)
   final case class ErrorBody(`type`: String = "error", error: ErrorDetail)
 
+  /** Streaming (SSE) event payloads -- each is the payload of one named
+    * `event:` / `data:` pair in Anthropic's wire format. A dedicated
+    * `MessageStartMessage` (rather than reusing `MessagesResponse`) is
+    * used for `message_start` because the real event's `stop_reason` is
+    * `null` at that point, and `MessagesResponse.stop_reason` is a
+    * required String on the non-streaming response -- this avoids
+    * loosening that shape just to accommodate streaming's partial
+    * state.
+    *
+    * MVP: a tool_use block's full `input` is emitted as a single
+    * `input_json_delta` rather than split across several partial JSON
+    * fragments -- see the equivalent OpenAI-side comment in that
+    * object; same deferral to fault injection applies here.
+    */
+  final case class StreamUsage(input_tokens: Option[Int] = None, output_tokens: Option[Int] = None)
+  final case class MessageStartMessage(
+      id: String,
+      `type`: String = "message",
+      role: String = "assistant",
+      content: List[ContentBlock] = Nil,
+      model: String,
+      stop_reason: Option[String] = None,
+      usage: StreamUsage
+  )
+  final case class MessageStartPayload(`type`: String = "message_start", message: MessageStartMessage)
+  final case class ContentBlockStartPayload(`type`: String = "content_block_start", index: Int, content_block: ContentBlock)
+  final case class TextDelta(`type`: String = "text_delta", text: String)
+  final case class InputJsonDelta(`type`: String = "input_json_delta", partial_json: String)
+  // Both delta shapes above share a `type` discriminator on the wire,
+  // but each only ever appears standalone inside a
+  // ContentBlockDeltaPayload built by the simulator -- never decoded
+  // back on llmsim's side -- so `delta` is plain Json here rather than
+  // a sealed trait Codec.
+  final case class ContentBlockDeltaPayload(`type`: String = "content_block_delta", index: Int, delta: Json)
+  final case class ContentBlockStopPayload(`type`: String = "content_block_stop", index: Int)
+  final case class MessageDeltaInner(stop_reason: String, stop_sequence: Option[String] = None)
+  final case class MessageDeltaPayload(`type`: String = "message_delta", delta: MessageDeltaInner, usage: StreamUsage)
+  final case class MessageStopPayload(`type`: String = "message_stop")
+
   implicit val contentBlockCodec: Codec[ContentBlock]         = deriveCodec
   implicit val usageCodec: Codec[Usage]                       = deriveCodec
   implicit val messagesRequestCodec: Codec[MessagesRequest]   = deriveCodec
   implicit val messagesResponseCodec: Codec[MessagesResponse] = deriveCodec
   implicit val errorDetailCodec: Codec[ErrorDetail]           = deriveCodec
   implicit val errorBodyCodec: Codec[ErrorBody]               = deriveCodec
+  implicit val streamUsageCodec: Codec[StreamUsage]                           = deriveCodec
+  implicit val messageStartMessageCodec: Codec[MessageStartMessage]           = deriveCodec
+  implicit val messageStartPayloadCodec: Codec[MessageStartPayload]           = deriveCodec
+  implicit val contentBlockStartPayloadCodec: Codec[ContentBlockStartPayload] = deriveCodec
+  implicit val textDeltaCodec: Codec[TextDelta]                               = deriveCodec
+  implicit val inputJsonDeltaCodec: Codec[InputJsonDelta]                     = deriveCodec
+  implicit val contentBlockDeltaPayloadCodec: Codec[ContentBlockDeltaPayload] = deriveCodec
+  implicit val contentBlockStopPayloadCodec: Codec[ContentBlockStopPayload]   = deriveCodec
+  implicit val messageDeltaInnerCodec: Codec[MessageDeltaInner]               = deriveCodec
+  implicit val messageDeltaPayloadCodec: Codec[MessageDeltaPayload]           = deriveCodec
+  implicit val messageStopPayloadCodec: Codec[MessageStopPayload]             = deriveCodec
 }
