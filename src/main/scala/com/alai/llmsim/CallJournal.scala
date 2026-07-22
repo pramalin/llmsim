@@ -13,6 +13,19 @@ object CapturedMessage {
   implicit val codec: Codec[CapturedMessage] = deriveCodec
 }
 
+/** A response header llmsim actually emitted, most commonly from a
+  * script's `headers` field (rate-limit headers, `retry-after`, etc.).
+  * `Vector[CapturedHeader]` rather than `Map[String, String]`
+  * deliberately -- captured wire data should preserve duplicate names,
+  * original casing, and original order, none of which a Map can. The
+  * public script DSL still accepts a Map for convenience; this is only
+  * what got recorded after the fact.
+  */
+final case class CapturedHeader(name: String, value: String)
+object CapturedHeader {
+  implicit val codec: Codec[CapturedHeader] = deriveCodec
+}
+
 /** What the simulator did with a call. Three cases:
   *   - Responded: answered normally (a Reply step, or Overrun.RepeatLast/Cycle)
   *   - Rejected: answered with a deliberate error -- either an Error step,
@@ -73,7 +86,12 @@ final case class CapturedCall(
     // is the wrong source for measuring elapsed duration. See Simulator's
     // recordTimed, which is the only caller of `record` and is what
     // actually captures both clocks.
-    durationMillis: Long
+    durationMillis: Long,
+    // Empty for the common case (no script-level headers, or a
+    // synthetic llmsim-internal error where the step's own headers
+    // don't apply -- see Simulator.scala's recordTimed call sites for
+    // which branches populate this).
+    responseHeaders: Vector[CapturedHeader] = Vector.empty
 )
 
 trait CallJournal {
@@ -86,7 +104,8 @@ trait CallJournal {
       stepIndex: Option[Int],
       receivedAtEpochMillis: Long,
       completedAtEpochMillis: Long,
-      durationMillis: Long
+      durationMillis: Long,
+      responseHeaders: Vector[CapturedHeader] = Vector.empty
   ): IO[CapturedCall]
 
   def all: IO[List[CapturedCall]]
@@ -128,12 +147,13 @@ object CallJournal {
             stepIndex: Option[Int],
             receivedAtEpochMillis: Long,
             completedAtEpochMillis: Long,
-            durationMillis: Long
+            durationMillis: Long,
+            responseHeaders: Vector[CapturedHeader] = Vector.empty
         ): IO[CapturedCall] =
           stateRef.modify { state =>
             val call = CapturedCall(
               state.nextSequence, provider, model, messages, rawRequest, outcome, stepIndex,
-              receivedAtEpochMillis, completedAtEpochMillis, durationMillis
+              receivedAtEpochMillis, completedAtEpochMillis, durationMillis, responseHeaders
             )
             val retained = (state.calls :+ call).takeRight(maxEntries)
             JournalState(state.nextSequence + 1, retained) -> call

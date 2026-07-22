@@ -9,7 +9,10 @@ package com.alai.llmsim
   * count (a budget check, a context-window boundary) precisely, rather
   * than at whatever the heuristic happens to produce for that step's text.
   */
-final case class UsageOverride(promptTokens: Int, completionTokens: Int)
+final case class UsageOverride(promptTokens: Int, completionTokens: Int) {
+  require(promptTokens >= 0, s"promptTokens must be >= 0, got $promptTokens")
+  require(completionTokens >= 0, s"completionTokens must be >= 0, got $completionTokens")
+}
 
 /** A single call gets answered by one Step.
   *

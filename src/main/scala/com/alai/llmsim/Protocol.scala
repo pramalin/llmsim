@@ -48,12 +48,16 @@ object OpenAI {
       tool_call_id: Option[String] = None
   )
   object Message {
-    // An array-of-parts content is flattened to the concatenation of
-    // its text parts -- enough to exercise a script's Reply/ToolCall
-    // logic, which only ever reads message text, never structured parts.
+    // An array-of-parts content is flattened to its text parts joined by
+    // a space -- enough to exercise a script's Reply/ToolCall logic,
+    // which only ever reads message text, never structured parts. Joined
+    // WITH a separator deliberately: mkString with no argument
+    // concatenates with none at all, so ["hello", "world"] would become
+    // "helloworld" rather than "hello world", corrupting both the
+    // normalized journal content and the fallback token-count heuristic.
     private val arrayContentAsString: Decoder[Option[String]] =
       Decoder[List[Json]].map { parts =>
-        val text = parts.flatMap(_.asObject).flatMap(_("text")).flatMap(_.asString).mkString
+        val text = parts.flatMap(_.asObject).flatMap(_("text")).flatMap(_.asString).mkString(" ")
         if (text.isEmpty) None else Some(text)
       }
 

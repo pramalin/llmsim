@@ -60,14 +60,16 @@ object Simulator {
         outcome: CallOutcome,
         stepIndex: Option[Int],
         receivedAt: FiniteDuration,
-        startedAt: FiniteDuration
+        startedAt: FiniteDuration,
+        responseHeaders: Map[String, String] = Map.empty
     ): IO[CapturedCall] =
       for {
         finishedAt  <- Clock[IO].monotonic
         completedAt <- Clock[IO].realTime
         call        <- journal.record(
                           provider, model, messages, rawRequest, outcome, stepIndex,
-                          receivedAt.toMillis, completedAt.toMillis, (finishedAt - startedAt).toMillis
+                          receivedAt.toMillis, completedAt.toMillis, (finishedAt - startedAt).toMillis,
+                          responseHeaders.map { case (k, v) => CapturedHeader(k, v) }.toVector
                         )
       } yield call
 
@@ -123,7 +125,7 @@ object Simulator {
                                          val responseJson = response.asJson
                                          for {
                                            _      <- recordTimed("openai", model, messages, json,
-                                                        CallOutcome.Responded(200, responseJson), Some(idx), receivedAt, startedAt)
+                                                        CallOutcome.Responded(200, responseJson), Some(idx), receivedAt, startedAt, headers)
                                            result <- withHeaders(Ok(responseJson), headers)
                                          } yield result
 
@@ -150,7 +152,7 @@ object Simulator {
                                          val responseJson = response.asJson
                                          for {
                                            _      <- recordTimed("openai", model, messages, json,
-                                                        CallOutcome.Responded(200, responseJson), Some(idx), receivedAt, startedAt)
+                                                        CallOutcome.Responded(200, responseJson), Some(idx), receivedAt, startedAt, headers)
                                            result <- withHeaders(Ok(responseJson), headers)
                                          } yield result
 
@@ -184,7 +186,7 @@ object Simulator {
                                              val responseJson = response.asJson
                                              for {
                                                _      <- recordTimed("openai", model, messages, json,
-                                                            CallOutcome.Responded(200, responseJson), Some(idx), receivedAt, startedAt)
+                                                            CallOutcome.Responded(200, responseJson), Some(idx), receivedAt, startedAt, headers)
                                                result <- withHeaders(Ok(responseJson), headers)
                                              } yield result
                                          }
@@ -193,7 +195,7 @@ object Simulator {
                                          val errorJson = OpenAI.ErrorBody(OpenAI.ErrorDetail(message)).asJson
                                          for {
                                            _      <- recordTimed("openai", model, messages, json,
-                                                        CallOutcome.Rejected(status, message), Some(idx), receivedAt, startedAt)
+                                                        CallOutcome.Rejected(status, message), Some(idx), receivedAt, startedAt, headers)
                                            result <- errorResponse(status, errorJson, headers)
                                          } yield result
 
@@ -238,7 +240,7 @@ object Simulator {
                                          val responseJson = response.asJson
                                          for {
                                            _      <- recordTimed("anthropic", model, messages, json,
-                                                        CallOutcome.Responded(200, responseJson), Some(idx), receivedAt, startedAt)
+                                                        CallOutcome.Responded(200, responseJson), Some(idx), receivedAt, startedAt, headers)
                                            result <- withHeaders(Ok(responseJson), headers)
                                          } yield result
 
@@ -271,7 +273,7 @@ object Simulator {
                                              val responseJson = response.asJson
                                              for {
                                                _      <- recordTimed("anthropic", model, messages, json,
-                                                            CallOutcome.Responded(200, responseJson), Some(idx), receivedAt, startedAt)
+                                                            CallOutcome.Responded(200, responseJson), Some(idx), receivedAt, startedAt, headers)
                                                result <- withHeaders(Ok(responseJson), headers)
                                              } yield result
                                          }
@@ -300,7 +302,7 @@ object Simulator {
                                              val responseJson = response.asJson
                                              for {
                                                _      <- recordTimed("anthropic", model, messages, json,
-                                                            CallOutcome.Responded(200, responseJson), Some(idx), receivedAt, startedAt)
+                                                            CallOutcome.Responded(200, responseJson), Some(idx), receivedAt, startedAt, headers)
                                                result <- withHeaders(Ok(responseJson), headers)
                                              } yield result
                                          }
@@ -309,7 +311,7 @@ object Simulator {
                                          val errorJson = Anthropic.ErrorBody(error = Anthropic.ErrorDetail("simulated_error", message)).asJson
                                          for {
                                            _      <- recordTimed("anthropic", model, messages, json,
-                                                        CallOutcome.Rejected(status, message), Some(idx), receivedAt, startedAt)
+                                                        CallOutcome.Rejected(status, message), Some(idx), receivedAt, startedAt, headers)
                                            result <- errorResponse(status, errorJson, headers)
                                          } yield result
 

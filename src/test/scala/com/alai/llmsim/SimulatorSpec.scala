@@ -401,6 +401,17 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
       }
     }
 
+    "a Reply step's headers are also captured in the journal, not just sent on the wire" in {
+      for {
+        c     <- clientFor(Script.exactly(reply("hi", headers = Map("x-ratelimit-remaining-requests" -> "59"))))
+        _     <- c.expect[String](openAIRequest())
+        calls <- c.expect[List[CapturedCall]](Request[IO](Method.GET, uri"/_llmsim/calls"))
+      } yield {
+        calls.head.responseHeaders should contain(CapturedHeader("x-ratelimit-remaining-requests", "59"))
+      }
+    }
+
+
     "an Error step's headers (retry-after on a 429) are returned verbatim" in {
       for {
         c    <- clientFor(Script.exactly(error(429, "rate limit exceeded", headers = Map(
@@ -455,6 +466,35 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
       } yield {
         resp.get(org.typelevel.ci.CIString("anthropic-ratelimit-requests-remaining")).map(_.head.value) shouldBe Some("999")
         resp.get(org.typelevel.ci.CIString("anthropic-ratelimit-requests-reset")).map(_.head.value) shouldBe Some("2026-07-21T19:00:00Z")
+      }
+    }
+  }
+
+  "array-shaped message content" - {
+
+    "OpenAI array-of-parts content is joined with spaces, not concatenated" in {
+      // OpenAI.Message.content is Option[String] on the typed encoder,
+      // so openAIRequest() can never exercise the array-of-parts decode
+      // path -- a raw JSON body is the only way to test it directly.
+      val rawBody = Json.obj(
+        "model" -> Json.fromString("gpt-4o-mini"),
+        "messages" -> Json.arr(
+          Json.obj(
+            "role" -> Json.fromString("user"),
+            "content" -> Json.arr(
+              Json.obj("type" -> Json.fromString("text"), "text" -> Json.fromString("hello")),
+              Json.obj("type" -> Json.fromString("text"), "text" -> Json.fromString("world"))
+            )
+          )
+        )
+      )
+      for {
+        c     <- clientFor(Script.exactly(reply("hi")))
+        _     <- c.expect[String](Request[IO](Method.POST, uri"/v1/chat/completions").withEntity(rawBody))
+        calls <- c.expect[List[CapturedCall]](Request[IO](Method.GET, uri"/_llmsim/calls"))
+      } yield {
+        // Not "helloworld" -- see Protocol.scala's arrayContentAsString.
+        calls.head.messages.head.content shouldBe "hello world"
       }
     }
   }
