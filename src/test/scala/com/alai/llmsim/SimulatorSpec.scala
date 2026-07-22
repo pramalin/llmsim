@@ -629,7 +629,7 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
     // scripted string, contradicting the whole "same script, different
     // transport" design this feature exists to preserve. Fixed via
     // split(" ", -1); these are the cases that would have caught it.
-    List("", " ", "hello ", "  hello", "hello  world", "hello   ",
+    List("hello world", "", " ", "hello ", "  hello", "hello  world", "hello   ",
          "hello\nworld", "hello\tworld", "Hello \ud83d\udc4b world").foreach { text =>
       s"a Reply step with text '${displayable(text)}' streams to exactly the scripted string, whitespace included" in {
         for {
@@ -729,7 +729,7 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
 
     // Same regression coverage as the OpenAI block above, for the
     // Anthropic-shaped endpoint -- wordChunks is shared between both.
-    List("", " ", "hello ", "  hello", "hello  world", "hello   ",
+    List("hello world", "", " ", "hello ", "  hello", "hello  world", "hello   ",
          "hello\nworld", "hello\tworld", "Hello \ud83d\udc4b world").foreach { text =>
       s"a Reply step with text '${displayable(text)}' streams to exactly the scripted string, whitespace included" in {
         for {
