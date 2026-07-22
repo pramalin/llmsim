@@ -202,7 +202,9 @@ reply("hello", usage = usage(promptTokens = 3900, completionTokens = 50))
 
 The same `promptTokens`/`completionTokens` pair maps onto both wire
 shapes: OpenAI's `usage.prompt_tokens`/`usage.completion_tokens` and
-Anthropic's `usage.input_tokens`/`usage.output_tokens`.
+Anthropic's `usage.input_tokens`/`usage.output_tokens`. Both values must
+be `>= 0` — `usage(-1, 50)` throws immediately when the script is built,
+rather than a negative count silently reaching either wire format.
 
 ### Response headers
 
@@ -253,7 +255,10 @@ curl -s http://localhost:8089/_llmsim/calls
     "stepIndex": 0,
     "receivedAtEpochMillis": 1732000000000,
     "completedAtEpochMillis": 1732000000012,
-    "durationMillis": 12
+    "durationMillis": 12,
+    "responseHeaders": [
+      { "name": "x-ratelimit-remaining-requests", "value": "59" }
+    ]
   }
 ]
 ```
@@ -264,7 +269,11 @@ body is even decoded and just before the response is returned.
 `durationMillis` comes from a separate monotonic clock reading, not from
 subtracting the two epoch timestamps — wall-clock time can jump (NTP
 adjustment, clock skew) and is the wrong source for measuring elapsed
-duration.
+duration. `responseHeaders` is empty unless the step that answered this
+call had `headers` set (see "Response headers" above) — a `Vector`
+rather than the script's `Map`, so duplicate names, original casing, and
+original order all survive into the journal even though the public DSL
+only accepts a `Map` for convenience.
 
 `outcome.type` is one of:
 - `"responded"` — answered normally; `body` is the exact response sent.
@@ -334,7 +343,7 @@ against it rather than it being something already fully built. Your own
 project's script never needs to live inside llmsim's repo, and llmsim's
 engine source never needs to be copied into yours.
 
-**Pin a released version** (`llmsim-build:0.1.1`, as below) in application
+**Pin a released version** (`llmsim-build:0.2.0`, as below) in application
 repositories — an unrelated llmsim release shouldn't be able to break your
 build out from under you. `:latest` exists for quickly evaluating llmsim
 itself, not for building on top of.
@@ -343,7 +352,7 @@ Your project gets its own tiny `Dockerfile` (e.g. `llmsim/Dockerfile` in
 your repo) that layers just your script on top of the published engine:
 
 ```dockerfile
-FROM ghcr.io/pramalin/llmsim-build:0.1.1 AS build
+FROM ghcr.io/pramalin/llmsim-build:0.2.0 AS build
 COPY AnalyticsFlow.scala /build/src/main/scala/com/example/agenticanalytics/llmsim/AnalyticsFlow.scala
 RUN sbt assembly
 
@@ -492,9 +501,18 @@ Pushing a version tag publishes both images to GHCR automatically (see
 `.github/workflows/publish.yml`):
 
 ```bash
-git tag v0.1.2
-git push origin v0.1.2
+git tag v0.2.1
+git push origin v0.2.1
 ```
+
+> **A note on the version history**: `v0.2.0` and `v0.1.1` were tagged out
+> of semantic order — `v0.1.1` was pushed *after* `v0.2.0`, so it
+> currently holds the floating `:latest` tag despite the lower version
+> number. `v0.1.1`'s commit is a strict, linear descendant of `v0.2.0`'s
+> (nothing is missing, `v0.1.1` simply has six more commits on top) — it
+> was a numbering mistake, not a content divergence. Every release from
+> `v0.2.1` onward is numbered to stay strictly increasing with push order
+> going forward.
 
 This runs the full test suite, then gates the push on two independent
 checks against the images about to ship, not just against llmsim's own
@@ -524,6 +542,14 @@ exercises the routes in-process, and `PublishedApiContractSpec` checks our
 case classes against example payloads shaped like each vendor's published
 docs rather than making a live call.
 
+Every push to `main` and every pull request also runs the full gate
+(`.github/workflows/ci.yml`): the test suite, the `ci/smoke-test/`
+extension-pattern check, and `ci/spring-verification`'s real Spring AI
+client checks — the same three checks `publish.yml` runs before a
+release, just without a version tag or anything getting pushed. Ordinary
+commits weren't tested at all before this existed; only a version-tag
+push ran anything.
+
 ## Roadmap
 
 1. ~~Single canned response~~ — done
@@ -536,15 +562,16 @@ docs rather than making a live call.
 8. ~~Plan and scope a sample Spring AI verification module~~ — done, as `ci/spring-verification/`.
 9. ~~Build it~~ — done: a minimal Spring Boot + Maven module (`ci/spring-verification/`) proving a real Spring AI client (both OpenAI- and Anthropic-shaped) correctly parses what llmsim sends, including a `@Disabled` test tracking [spring-projects/spring-ai#6607](https://github.com/spring-projects/spring-ai/issues/6607) (OpenAI rate-limit headers aren't wired into `ChatResponseMetadata` as of Spring AI 2.0.0 — an upstream gap, not an llmsim one). Wired into `.github/workflows/publish.yml` as a release gate alongside the existing smoke test.
 10. ~~Cut a release~~ — done, `v0.1.1`: items 6–9 above, a real usable release on its own, none of it depending on SSE existing.
+11. ~~Small pre-SSE prep batch~~ — done: `CapturedCall.responseHeaders` (a `Vector[CapturedHeader]`, not a `Map`, so duplicate names/casing/order survive into the journal even though the script DSL still accepts a `Map`); array-of-parts message content now joined with a space instead of concatenated with none; `UsageOverride` rejects negative values at construction; and `.github/workflows/ci.yml`, running the same three gates as `publish.yml` on every push to `main` and every pull request, not just on a version-tag push. Also where the `v0.1.1`/`v0.2.0` tag-numbering mixup got caught and corrected — see "Releasing new versions" above.
 
-11. Streaming responses (SSE) — a new release cycle starting fresh from `v0.1.1`, for both OpenAI- and Anthropic-shaped endpoints, enough of each vendor's real wire format to exercise Spring AI's `ChatClient` `Flux<String>` / `Flux<ChatResponse>` streaming paths.
+12. Streaming responses (SSE) — a new release cycle, for both OpenAI- and Anthropic-shaped endpoints, enough of each vendor's real wire format to exercise Spring AI's `ChatClient` `Flux<String>` / `Flux<ChatResponse>` streaming paths.
 
-    **Definition of done extends `ci/spring-verification` rather than creating a new module.** llmsim can assert that it *sent* well-formed SSE; it can't assert that a real Spring AI `ChatClient` *parsed* it correctly. Since that module and its CI gate already exist, this step adds streaming test cases to it — normal token-by-token streaming completing cleanly, a mid-stream disconnect surfacing as the correct exception, a tool call's arguments reassembling correctly — rather than standing up a second verification harness.
+    **Definition of done extends `ci/spring-verification` rather than creating a new module.** llmsim can assert that it *sent* well-formed SSE; it can't assert that a real Spring AI `ChatClient` *parsed* it correctly. Since that module and its CI gate already exist, this step adds streaming test cases to it — normal token-by-token streaming completing cleanly, a mid-stream disconnect surfacing as the correct exception, a tool call's arguments reassembling correctly — rather than standing up a second verification harness. Before the tool-call-streaming portion specifically, add one non-streaming baseline first: a real registered `@Tool` callback round trip (llmsim returns a tool call → Spring AI actually invokes the Java callback → sends the real result back → `replyFromToolResult` answers) — today's tool-call test deliberately stops at "Spring AI parsed the tool_calls block," short of execution, and having that baseline pass first means a streamed-tool-call failure later is clearly an SSE problem, not an ambiguous one.
 
-12. Bare-bones dashboard — a plain JSON endpoint (`GET /_llmsim/dashboard`) rendered by a single static HTML page served alongside the API, no build step or framework. Makes call outcomes and latency visible while streaming and fault injection are still being iterated on — not a final UI, and not a substitute for item 11's real-client verification.
-13. Streaming fault injection: delayed first token, delayed inter-token gaps, mid-stream disconnect, malformed SSE event, stream ending without a completion event, tool-call arguments split across chunks, and HTTP 429 before streaming begins. Validated against the item 12 dashboard as each fault type is added, and extend `ci/spring-verification` (item 11) to cover the fault types that matter most for a real client (mid-stream disconnect, split tool-call arguments).
-14. `GET /v1/models`.
-15. The real Angular console (`console-angular/`), served by the standalone image at `/_llmsim/ui`, with overview/calls/timeline/streaming views as designed. Deliberately last — the data model (streams, faults) needs to be settled first so the UI is built once against a stable shape instead of reworked mid-flight.
+13. Bare-bones dashboard — a plain JSON endpoint (`GET /_llmsim/dashboard`) rendered by a single static HTML page served alongside the API, no build step or framework. Makes call outcomes and latency visible while streaming and fault injection are still being iterated on — not a final UI, and not a substitute for item 12's real-client verification.
+14. Streaming fault injection: delayed first token, delayed inter-token gaps, mid-stream disconnect, malformed SSE event, stream ending without a completion event, tool-call arguments split across chunks, and HTTP 429 before streaming begins. Validated against the item 13 dashboard as each fault type is added, and extend `ci/spring-verification` (item 12) to cover the fault types that matter most for a real client (mid-stream disconnect, split tool-call arguments). This is also where `CallJournal`'s record-on-completion model is worth revisiting toward a `begin`/`complete`/`fail`/`cancel` lifecycle — deliberately not built for item 12, since a fully scripted, non-delayed stream has no genuine in-flight/cancelled state to represent yet, but delayed and disconnectable streams do.
+15. `GET /v1/models`.
+16. The real Angular console (`console-angular/`), served by the standalone image at `/_llmsim/ui`, with overview/calls/timeline/streaming views as designed. Deliberately last — the data model (streams, faults) needs to be settled first so the UI is built once against a stable shape instead of reworked mid-flight.
 
 `agentic-analytics` remains a pure downstream consumer throughout all of the above — it always pins a released `llmsim-build` tag (never a dev build), the same as any other project building on llmsim.
 
