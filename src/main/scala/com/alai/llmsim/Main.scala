@@ -75,7 +75,7 @@ object Main extends IOApp.Simple {
                         s"onOverrun=${script.onOverrun}), journal capped at $maxEntries entries, " +
                         s"listening on port ${port.value}"
                     )
-      httpApp    <- App.build(script, maxEntries)
+      httpApp    <- App.build(script, maxEntries, scriptName = Some(className))
       _ <- EmberServerBuilder
              .default[IO]
              .withHost(host"0.0.0.0")

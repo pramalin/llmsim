@@ -5,8 +5,10 @@ import cats.syntax.all._
 import org.http4s._
 import org.http4s.dsl.io._
 import org.http4s.circe._
+import org.typelevel.ci.CIString
 import io.circe.Encoder
 import io.circe.generic.semiauto.deriveEncoder
+import Dashboard._
 
 /** Endpoints for the TEST HARNESS -- never the application under test.
   * These live under /_llmsim/..., a path namespace clearly separate from
@@ -27,7 +29,15 @@ object ManagementRoutes {
   private implicit val statusEntityEncoder: EntityEncoder[IO, StatusResponse] =
     jsonEncoderOf[IO, StatusResponse]
 
-  def routes(journal: CallJournal, runner: ScriptRunner): HttpRoutes[IO] =
+  private implicit val dashboardEntityEncoder: EntityEncoder[IO, DashboardSummary] =
+    jsonEncoderOf[IO, DashboardSummary]
+
+  def routes(
+      journal: CallJournal,
+      runner: ScriptRunner,
+      journalCapacity: Int,
+      scriptName: Option[String] = None
+  ): HttpRoutes[IO] =
     HttpRoutes.of[IO] {
       // Every call the simulator has answered so far, in order.
       case GET -> Root / "_llmsim" / "calls" =>
@@ -58,5 +68,23 @@ object ManagementRoutes {
           _      <- runner.reset
           result <- Ok("reset")
         } yield result
+
+      // The bare-bones dashboard's data (roadmap item 13). Cache-Control:
+      // no-store since this is meant to be polled live, not cached by an
+      // intermediary -- matches the page's own fetch(..., {cache:
+      // "no-store"}).
+      case GET -> Root / "_llmsim" / "dashboard" =>
+        for {
+          calls   <- journal.all
+          status  <- runner.status
+          summary =  Dashboard.summarize(calls, journalCapacity, status, scriptName)
+          result  <- Ok(summary).map(_.putHeaders(Header.Raw(CIString("Cache-Control"), "no-store")))
+        } yield result
+
+      // The dashboard's page -- a single static HTML file with no build
+      // step, served at the same path the eventual Angular console
+      // (roadmap item 16) will occupy later.
+      case GET -> Root / "_llmsim" / "ui" =>
+        Ok(Dashboard.htmlPage).map(_.putHeaders(Header.Raw(CIString("Content-Type"), "text/html; charset=utf-8")))
     }
 }
