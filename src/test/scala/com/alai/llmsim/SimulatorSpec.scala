@@ -78,6 +78,17 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
       (eventLine, dataLine)
     }
 
+  // Makes whitespace-containing test names actually readable in output
+  // -- a raw literal space/newline/tab in a ScalaTest test name is easy
+  // to misread or invisible entirely.
+  private def displayable(s: String): String =
+    s.flatMap {
+      case '\n' => "\\n"
+      case '\t' => "\\t"
+      case ' '  => "\u00b7"
+      case c    => c.toString
+    }
+
   "a script's replies are consumed in order, per call" in {
     for {
       c     <- clientFor(Script.exactly(reply("first"), reply("second"), reply("third")))
@@ -609,6 +620,28 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
         response <- c.expect[OpenAI.ChatResponse](openAIRequest())
       } yield response.choices.head.message.content shouldBe Some("hello there world")
     }
+
+    // Regression cases for the trailing-whitespace bug wordChunks had:
+    // String.split(" ") (no explicit limit) silently drops TRAILING
+    // empty strings, so "hello " streamed as "hello" (space lost) and
+    // "   " streamed as "" (nothing at all) -- streaming and
+    // non-streaming returning different content for the identical
+    // scripted string, contradicting the whole "same script, different
+    // transport" design this feature exists to preserve. Fixed via
+    // split(" ", -1); these are the cases that would have caught it.
+    List("", " ", "hello ", "  hello", "hello  world", "hello   ",
+         "hello\nworld", "hello\tworld", "Hello \ud83d\udc4b world").foreach { text =>
+      s"a Reply step with text '${displayable(text)}' streams to exactly the scripted string, whitespace included" in {
+        for {
+          c        <- clientFor(Script.exactly(reply(text)))
+          response <- c.run(openAIStreamingRequest()).use(_.bodyText.compile.string)
+          reconstructed = parseFrames(response).init.flatMap { case (_, data) =>
+            parseJson(data).toOption.flatMap(_.hcursor.downField("choices").downArray
+              .downField("delta").downField("content").as[String].toOption)
+          }.mkString
+        } yield reconstructed shouldBe text
+      }
+    }
   }
 
   "Anthropic SSE streaming" - {
@@ -661,6 +694,52 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
         c        <- clientFor(Script.exactly(reply("hello there world")))
         response <- c.expect[Anthropic.MessagesResponse](anthropicRequest())
       } yield response.content.head.text shouldBe Some("hello there world")
+    }
+
+    // Real Anthropic events omit an absent optional field entirely
+    // rather than sending it as JSON null -- a text content_block_start
+    // is documented as exactly {"type":"text","text":""}, not six keys
+    // with five of them null. circe's derived encoders include every
+    // Option field as explicit null by default; these confirm the
+    // dropNullValues fix in sseFrame actually took effect on the wire,
+    // not just that behavioral reconstruction still happens to work.
+    "a text content_block_start has no extraneous null keys" in {
+      for {
+        c        <- clientFor(Script.exactly(reply("hi")))
+        response <- c.expect[String](anthropicStreamingRequest())
+        frames = parseFrames(response)
+      } yield {
+        val data = frames.collectFirst { case (Some("content_block_start"), d) => d }.get
+        val obj  = parseJson(data).toOption.get.hcursor.downField("content_block").focus.get.asObject.get
+        obj.keys.toSet shouldBe Set("type", "text")
+      }
+    }
+
+    "message_delta.usage carries only output_tokens, not a null input_tokens" in {
+      for {
+        c        <- clientFor(Script.exactly(reply("hi")))
+        response <- c.expect[String](anthropicStreamingRequest())
+        frames = parseFrames(response)
+      } yield {
+        val data = frames.collectFirst { case (Some("message_delta"), d) => d }.get
+        val obj  = parseJson(data).toOption.get.hcursor.downField("usage").focus.get.asObject.get
+        obj.keys.toSet shouldBe Set("output_tokens")
+      }
+    }
+
+    // Same regression coverage as the OpenAI block above, for the
+    // Anthropic-shaped endpoint -- wordChunks is shared between both.
+    List("", " ", "hello ", "  hello", "hello  world", "hello   ",
+         "hello\nworld", "hello\tworld", "Hello \ud83d\udc4b world").foreach { text =>
+      s"a Reply step with text '${displayable(text)}' streams to exactly the scripted string, whitespace included" in {
+        for {
+          c        <- clientFor(Script.exactly(reply(text)))
+          response <- c.expect[String](anthropicStreamingRequest())
+          reconstructed = parseFrames(response).collect { case (Some("content_block_delta"), data) =>
+            parseJson(data).toOption.flatMap(_.hcursor.downField("delta").downField("text").as[String].toOption)
+          }.flatten.mkString
+        } yield reconstructed shouldBe text
+      }
     }
   }
 }

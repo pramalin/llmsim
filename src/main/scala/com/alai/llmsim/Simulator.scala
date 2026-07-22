@@ -6,7 +6,7 @@ import fs2.Stream
 import org.http4s._
 import org.http4s.dsl.io._
 import org.http4s.circe._
-import io.circe.Json
+import io.circe.{Json, Printer}
 import io.circe.parser.{parse => parseJson}
 import io.circe.syntax._
 import java.time.Instant
@@ -53,6 +53,21 @@ object Simulator {
     // processed (which is what the previous single-timestamp version
     // effectively recorded, since it stamped time inside `record` itself,
     // after the response was already built).
+    //
+    // For a STREAMED call specifically: this records BEFORE sseResponse
+    // is returned, not after the SSE body has actually been consumed by
+    // the client -- http4s/fs2 stream the body lazily, on the client's
+    // own read schedule, well after this function returns. So for a
+    // streamed call, completedAtEpochMillis/durationMillis currently mean
+    // "how long it took llmsim to build the response," not "how long the
+    // stream took to fully deliver," and the script step is already
+    // consumed even if the client disconnects before reading a single
+    // frame. This is invisible today only because every chunk is emitted
+    // immediately with no artificial delay; it stops being invisible the
+    // moment fault injection (roadmap item 14) adds delayed chunks,
+    // disconnects, or mid-stream failures -- which is also where a
+    // proper begin/complete/fail/cancel journal lifecycle belongs, not
+    // before there's an actual in-flight state worth representing.
     def recordTimed(
         provider: String,
         model: Option[String],
@@ -650,9 +665,20 @@ object Simulator {
   // environment.
   // ---------------------------------------------------------------------
 
+  // Explicit nulls dropped here, not just in the streaming shapes'
+  // definitions: real OpenAI/Anthropic chunks OMIT an absent optional
+  // field entirely (e.g. a text delta has no `tool_calls` key at all)
+  // rather than sending it as `null`, which circe's derived encoders do
+  // by default. One conversion point for every streaming payload is
+  // simpler and lower-risk than hand-writing a narrower encoder per
+  // shape, and -- deliberately -- this only touches SSE frames, not the
+  // non-streaming JSON bodies, which keep their existing (already
+  // documented, already tested) explicit-null shape.
+  private val dropNullPrinter = Printer.noSpaces.copy(dropNullValues = true)
+
   private def sseFrame(event: Option[String], data: Json): String = {
     val eventLine = event.map(e => s"event: $e\n").getOrElse("")
-    s"$eventLine" + s"data: ${data.noSpaces}\n\n"
+    s"$eventLine" + s"data: ${dropNullPrinter.print(data)}\n\n"
   }
 
   private def sseResponse(frames: Stream[IO, String], headers: Map[String, String]): IO[Response[IO]] =
@@ -674,8 +700,19 @@ object Simulator {
   // is where finer-grained or deliberately-odd chunking becomes a
   // script's explicit choice; MVP always sends one complete word per
   // chunk.
+  //
+  // split(" ", -1) deliberately, not split(" "): the no-limit-argument
+  // form of split silently drops TRAILING empty strings, which for this
+  // purpose means the reply "hello " would stream as "hello" (its
+  // trailing space lost) and an all-whitespace reply like "   " would
+  // stream as "" (nothing at all) -- streaming and non-streaming
+  // transports returning different content for the identical scripted
+  // string, which is exactly the invariant this whole design exists to
+  // preserve. The -1 limit keeps every trailing empty piece so the
+  // reconstructed stream matches the scripted text exactly, whitespace
+  // included.
   private def wordChunks(text: String): List[String] =
-    text.split(" ").toList.zipWithIndex.map { case (w, i) => if (i == 0) w else s" $w" }
+    text.split(" ", -1).toList.zipWithIndex.map { case (w, i) => if (i == 0) w else s" $w" }
 
   // A script-provided UsageOverride is used verbatim when present -- for
   // testing behavior at a specific token count precisely (a budget check,
