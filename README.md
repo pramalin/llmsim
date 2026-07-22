@@ -328,6 +328,80 @@ Anthropic's are RFC 3339 timestamps — two genuinely different wire
 formats, so the script controls the exact value that goes out rather
 than llmsim deciding how to translate between them.
 
+### Streaming (SSE)
+
+No script changes needed for this at all — the same `reply`/`toolCall`/
+`replyFromToolResult` steps answer both transports. What decides
+streaming is the *request*: set `"stream": true` and llmsim answers as
+Server-Sent Events instead of one JSON body.
+
+```bash
+curl -s -X POST http://localhost:8089/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4o-mini","stream":true,"messages":[{"role":"user","content":"hello"}]}'
+```
+
+Against a script whose current step is `reply("Hi there")`, that's the
+actual raw response body:
+
+```
+data: {"id":"chatcmpl-sim-3f9a2b7e-...","object":"chat.completion.chunk","created":1732000000,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":null},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-sim-3f9a2b7e-...","object":"chat.completion.chunk","created":1732000000,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":null,"content":"Hi","tool_calls":null},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-sim-3f9a2b7e-...","object":"chat.completion.chunk","created":1732000000,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":null,"content":" there","tool_calls":null},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-sim-3f9a2b7e-...","object":"chat.completion.chunk","created":1732000000,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":null,"content":null,"tool_calls":null},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+```
+
+(`id` and `created` vary between runs.) The Anthropic-shaped endpoint
+answers with its own named-event format for the same script step:
+
+```
+event: message_start
+data: {"type":"message_start","message":{"id":"msg-sim-...","type":"message","role":"assistant","content":[],"model":"claude-sonnet-5","stop_reason":null,"usage":{"input_tokens":1,"output_tokens":0}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":"","id":null,"name":null,"input":null,"tool_use_id":null,"content":null}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" there"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":null,"output_tokens":2}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+```
+
+A `toolCall(...)` step streams the same way — one chunk carrying the
+role, one carrying the complete tool call (name and arguments together,
+not split across chunks), one final chunk with `finish_reason:
+"tool_calls"` — rather than a real model's occasional habit of splitting
+a single word or a tool call's arguments across several chunks. That
+finer-grained, deliberately-odd chunking is future fault-injection work
+(see the Roadmap), something a script will opt into, not today's default
+streaming behavior.
+
+Two things streaming doesn't do yet, on purpose, not by oversight:
+scripted `usage` isn't included in a streamed response (real OpenAI only
+adds it when a request sets `stream_options: {"include_usage": true}`,
+which llmsim doesn't read yet), and there's no artificial delay between
+chunks — every chunk sends as fast as the underlying stream can flush,
+so time-to-first-token/fault-injection scenarios aren't representable
+yet either. Scripted `headers` still apply exactly as they do
+non-streaming.
+
 ## Inspecting captured calls
 
 Every call the simulator receives is recorded — provider, a normalized
@@ -355,7 +429,8 @@ curl -s http://localhost:8089/_llmsim/calls
     "durationMillis": 12,
     "responseHeaders": [
       { "name": "x-ratelimit-remaining-requests", "value": "59" }
-    ]
+    ],
+    "streamed": false
   }
 ]
 ```
@@ -370,7 +445,10 @@ duration. `responseHeaders` is empty unless the step that answered this
 call had `headers` set (see "Response headers" above) — a `Vector`
 rather than the script's `Map`, so duplicate names, original casing, and
 original order all survive into the journal even though the public DSL
-only accepts a `Map` for convenience.
+only accepts a `Map` for convenience. `streamed` is `true` for a call
+answered as SSE (see "Streaming (SSE)" above) — `outcome.body` records
+the same logical response shape either way, so `streamed` is the only
+field that tells you which transport was actually used.
 
 `outcome.type` is one of:
 - `"responded"` — answered normally; `body` is the exact response sent.
@@ -694,11 +772,13 @@ push ran anything.
 10. ~~Cut a release~~ — done, `v0.1.1`: items 6–9 above, a real usable release on its own, none of it depending on SSE existing.
 11. ~~Small pre-SSE prep batch~~ — done: `CapturedCall.responseHeaders` (a `Vector[CapturedHeader]`, not a `Map`, so duplicate names/casing/order survive into the journal even though the script DSL still accepts a `Map`); array-of-parts message content now joined with a space instead of concatenated with none; `UsageOverride` rejects negative values at construction; and `.github/workflows/ci.yml`, running the same three gates as `publish.yml` on every push to `main` and every pull request, not just on a version-tag push. Also where the `v0.1.1`/`v0.2.0` tag-numbering mixup got caught and corrected — see "Releasing new versions" above.
 
-12. Streaming responses (SSE) — a new release cycle, for both OpenAI- and Anthropic-shaped endpoints, enough of each vendor's real wire format to exercise Spring AI's `ChatClient` `Flux<String>` / `Flux<ChatResponse>` streaming paths.
+12. ~~Streaming responses (SSE)~~ — done, for both OpenAI- and Anthropic-shaped endpoints: `Protocol.scala` gained `stream` on both request types plus each vendor's real streaming wire shapes (OpenAI's data-only `chat.completion.chunk`, Anthropic's named `message_start`..`message_stop` event sequence), `Simulator.scala` gained six guarded branches (`Reply`/`ToolCall`/`ReplyFromToolResult` × two providers) so the exact same script answers either transport, and `CapturedCall.streamed` records which one a given call used. MVP sends whole units per chunk (a whole word, a whole tool call) — see "Streaming (SSE)" above for what's deliberately deferred and why.
 
-    **Definition of done extends `ci/spring-verification` rather than creating a new module.** llmsim can assert that it *sent* well-formed SSE; it can't assert that a real Spring AI `ChatClient` *parsed* it correctly. Since that module and its CI gate already exist, this step adds streaming test cases to it — normal token-by-token streaming completing cleanly, a mid-stream disconnect surfacing as the correct exception, a tool call's arguments reassembling correctly — rather than standing up a second verification harness.
+    **Verified two ways, per the original definition of done.** llmsim's own wire-level tests (`SimulatorSpec.scala`, "OpenAI/Anthropic SSE streaming") assert on the raw frames — that's the authoritative check on what llmsim actually sends. `ci/spring-verification` extends the same real-client principle used everywhere else in this module: `openAiShapedClientStreamsTheScriptedReply`/`anthropicShapedClientStreamsTheScriptedReply` consume a real `Flux<String>` end to end, and `openAiShapedClientSurfacesTheStreamedToolCall` confirms a streamed tool call is still there once the stream completes — proving a real Spring AI `ChatClient` parses llmsim's streaming output correctly, not just that llmsim believes it's well-formed.
 
-    ~~Non-streaming tool-callback baseline~~ — done, ahead of the streaming work: `openAiToolCallRoundTripActuallyExecutesAndAnswers` registers a real Java `@Tool` on its own dedicated `ChatClient` (nothing global, so no other test risks auto-executing a tool call it only means to inspect), and confirms the full loop — llmsim returns a tool call, Spring AI actually invokes the callback, the real return value comes back in the follow-up request, `replyFromToolResult` answers from it. `openAiShapedClientSurfacesTheToolCall` (no tool registered) still covers the narrower "Spring AI parsed the block" case on its own. Having this pass first means a streamed-tool-call failure later is clearly an SSE problem, not an ambiguous one.
+    **Deliberately not attempted yet:** a full streamed tool-callback round trip (a real registered `@Tool` actually executing over a `Flux`, mirroring the non-streaming baseline above but streamed) — the least-traveled code path in Spring AI's tool-calling advisor, and worth its own focused pass rather than bundling into the change that first proves basic streaming works at all. A natural next step, not blocking anything below.
+
+    ~~Non-streaming tool-callback baseline~~ — done, ahead of the streaming work: `openAiToolCallRoundTripActuallyExecutesAndAnswers` registers a real Java `@Tool` on its own dedicated `ChatClient` (nothing global, so no other test risks auto-executing a tool call it only means to inspect), and confirms the full loop — llmsim returns a tool call, Spring AI actually invokes the callback, the real return value comes back in the follow-up request, `replyFromToolResult` answers from it. `openAiShapedClientSurfacesTheToolCall` (no tool registered) still covers the narrower "Spring AI parsed the block" case on its own. Having this pass first meant a streamed-tool-call failure would have been clearly an SSE problem, not an ambiguous one.
 
 13. Bare-bones dashboard — a plain JSON endpoint (`GET /_llmsim/dashboard`) rendered by a single static HTML page served alongside the API, no build step or framework. Makes call outcomes and latency visible while streaming and fault injection are still being iterated on — not a final UI, and not a substitute for item 12's real-client verification.
 14. Streaming fault injection: delayed first token, delayed inter-token gaps, mid-stream disconnect, malformed SSE event, stream ending without a completion event, tool-call arguments split across chunks, and HTTP 429 before streaming begins. Validated against the item 13 dashboard as each fault type is added, and extend `ci/spring-verification` (item 12) to cover the fault types that matter most for a real client (mid-stream disconnect, split tool-call arguments). This is also where `CallJournal`'s record-on-completion model is worth revisiting toward a `begin`/`complete`/`fail`/`cancel` lifecycle — deliberately not built for item 12, since a fully scripted, non-delayed stream has no genuine in-flight/cancelled state to represent yet, but delayed and disconnectable streams do.
