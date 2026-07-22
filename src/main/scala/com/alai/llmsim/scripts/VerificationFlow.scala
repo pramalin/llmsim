@@ -4,7 +4,7 @@ import com.alai.llmsim.{Script, ScriptSource}
 import com.alai.llmsim.Script._
 
 /** Boots llmsim for ci/spring-verification (see VerificationTest there).
-  * Nine steps, each consumed by exactly one test, in order, with no
+  * Eleven steps, each consumed by exactly one test, in order, with no
   * warmup or discard calls:
   *   0. A plain text reply -- OpenAI-shaped basic ChatClient check.
   *   1. The same reply again -- Anthropic-shaped basic ChatClient check
@@ -21,20 +21,22 @@ import com.alai.llmsim.Script._
   *      baseline round trip (llmsim returns a tool call, a real
   *      registered Java @Tool actually executes, its real return value
   *      comes back as the follow-up request's tool result, and this
-  *      step answers from that). Establishing this before SSE means a
-  *      streamed-tool-call failure later is clearly an SSE problem, not
+  *      step answers from that). Establishing this before SSE meant a
+  *      streamed-tool-call failure would be clearly an SSE problem, not
   *      an ambiguous "is it the tool loop or the stream" one.
   *   6. A plain text reply, streamed -- OpenAI-shaped Flux<String> check.
   *   7. The same, streamed -- Anthropic-shaped Flux<String> check.
   *   8. A third, distinct tool call, streamed -- proves a streamed
   *      tool_calls block surfaces correctly once the stream completes.
   *      Like step 2, no tool registered: parsing only, not execution.
-  *      A full streamed tool-callback round trip (mirroring steps 4-5,
-  *      but over Flux) is deliberately not attempted yet -- that's the
-  *      least-traveled code path in Spring AI's tool-calling advisor and
-  *      belongs as its own follow-up once basic streaming is confirmed
-  *      solid, not bundled into the same pass that first proves llmsim's
-  *      streaming wire format works at all.
+  *   9. A fourth, distinct tool call, together with step 10 --
+  *  10. -- a reply built from the REAL tool result, both streamed: the
+  *      streamed counterpart to steps 4-5, closing the gap those left
+  *      open. llmsim's own streaming plumbing was already covered by
+  *      steps 6-8; what this actually checks is Spring AI's side --
+  *      that its tool-calling advisor correctly recognizes a tool call
+  *      assembled across streamed chunks, invokes the real Java
+  *      callback, and streams the final answer from the real result.
   *
   * Kept in llmsim's own scripts package, not the verification module,
   * since Main loads scripts by fully-qualified name off llmsim's own
@@ -60,6 +62,8 @@ object VerificationFlow extends ScriptSource {
     replyFromToolResult("call-2")(result => s"Here's what the tool reported: $result"),
     reply("hello there world"),
     reply("hello there world"),
-    toolCall(id = "call-3", name = "get_weather", arguments = """{"city":"Seattle"}""")
+    toolCall(id = "call-3", name = "get_weather", arguments = """{"city":"Seattle"}"""),
+    toolCall(id = "call-4", name = "get_weather", arguments = """{"city":"Denver"}"""),
+    replyFromToolResult("call-4")(result => s"Streamed tool result: $result")
   )
 }

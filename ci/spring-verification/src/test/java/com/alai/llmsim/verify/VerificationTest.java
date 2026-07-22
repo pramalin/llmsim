@@ -43,8 +43,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * warmups, no discards, no room for retry amplification to matter.
  *
  * Requires llmsim running with
- * LLMSIM_SCRIPT=com.alai.llmsim.scripts.VerificationFlow, whose nine
- * steps this class's nine tests (the fifth disabled) consume in order.
+ * LLMSIM_SCRIPT=com.alai.llmsim.scripts.VerificationFlow, whose eleven
+ * steps this class's ten tests (the fifth disabled) consume in order.
  */
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 @SpringBootTest(classes = VerificationApplication.class)
@@ -191,11 +191,10 @@ class VerificationTest {
         // registered tool callback -- same reasoning as step 3's
         // non-streaming openAiShapedClientSurfacesTheToolCall: this
         // checks the tool_calls block round-trips correctly once the
-        // stream completes, not that Spring AI can auto-invoke it. A
-        // full streamed tool-callback round trip (mirroring
-        // openAiToolCallRoundTripActuallyExecutesAndAnswers, but over a
-        // stream) is deliberately not attempted here -- see
-        // VerificationFlow's Javadoc for why that's its own follow-up.
+        // stream completes, not that Spring AI can auto-invoke it. The
+        // full streamed round trip (real tool execution) is
+        // openAiStreamedToolCallRoundTripActuallyExecutesAndAnswers
+        // below, steps 9-10.
         Prompt prompt = new Prompt(List.of(new UserMessage("what is the weather in Seattle?")));
         Flux<ChatResponse> stream = openAiChatModel.stream(prompt);
 
@@ -217,5 +216,34 @@ class VerificationTest {
         assertThat(toolCallChunk.getResult().getOutput().getToolCalls().get(0).name()).isEqualTo("get_weather");
         assertThat(toolCallChunk.getResult().getOutput().getToolCalls().get(0).arguments())
                 .isEqualTo("{\"city\":\"Seattle\"}");
+    }
+
+    @Order(10)
+    @Test
+    void openAiStreamedToolCallRoundTripActuallyExecutesAndAnswers() {
+        // VerificationFlow steps 9 and 10: the same real tool-callback
+        // round trip as openAiToolCallRoundTripActuallyExecutesAndAnswers
+        // (step 4-5), but streamed -- ChatClient.stream() instead of
+        // .call(). llmsim's own streaming plumbing is already covered by
+        // steps 6-8 above; what this actually checks is Spring AI's
+        // side -- that its tool-calling advisor correctly recognizes a
+        // tool call assembled across streamed chunks, invokes the real
+        // Java callback, and streams the final answer built from the
+        // follow-up request's real tool result. A materially different
+        // code path from the synchronous one, and one this project has
+        // learned not to assume just works without checking.
+        WeatherTool weatherTool = new WeatherTool();
+        ChatClient client = ChatClient.builder(openAiChatModel)
+                .defaultTools(weatherTool)
+                .build();
+
+        Flux<String> stream = client.prompt("what's the weather like?").stream().content();
+        List<String> tokens = stream.collectList().block(Duration.ofSeconds(10));
+
+        assertThat(tokens).isNotNull();
+        assertThat(weatherTool.lastCity()).isEqualTo("Denver");
+        String answer = String.join("", tokens);
+        assertThat(answer).contains("Streamed tool result");
+        assertThat(answer).contains("72F and sunny in Denver");
     }
 }
