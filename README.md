@@ -480,6 +480,78 @@ These all live under `/_llmsim/...`, separate from the simulated vendor
 paths under `/v1/...` — the application under test only ever sees the
 latter.
 
+## Dashboard
+
+A bare-bones, read-only view of what the simulator's been doing, meant
+for a human glancing at it during development — not a substitute for
+`ci/spring-verification`'s real-client checks, and not the final UI (the
+real Angular console will eventually replace the page below, at the same
+path).
+
+```bash
+curl -s http://localhost:8089/_llmsim/dashboard
+```
+
+```json
+{
+  "schemaVersion": 1,
+  "script": {
+    "name": "com.alai.llmsim.scripts.WeatherFlow",
+    "totalSteps": 3,
+    "nextStepIndex": 1,
+    "onOverrun": "fail",
+    "exhausted": false
+  },
+  "journal": {
+    "retainedCalls": 2,
+    "capacity": 1000
+  },
+  "calls": {
+    "byOutcome": { "responded": 2, "rejected": 0, "failed": 0 },
+    "byProvider": { "openai": 2, "anthropic": 0 },
+    "streamed": 0
+  },
+  "latencyMillis": {
+    "sampleCount": 2,
+    "average": 6.5,
+    "p95": 12,
+    "max": 12
+  },
+  "lastCallAtEpochMillis": 1732000123456
+}
+```
+
+Every count here is scoped to the journal's *currently retained* calls,
+not a lifetime total — `journal.retainedCalls`/`capacity` make that
+scope visible in the payload itself, since the journal is bounded and
+can be cleared independently of the script (see above). `average`/
+`p95`/`max`/`lastCallAtEpochMillis` are `null`, not `0`, when the
+journal is empty — a freshly booted, idle simulator reads as "no data
+yet," not as a real (and wrong) latency figure. `p95` is nearest-rank
+over the retained calls' durations.
+
+`script.nextStepIndex` is `null` specifically when the script is
+exhausted *and* its overrun policy is `"fail"` — under `"repeatLast"` or
+`"cycle"` it's never null, since there's always a well-defined next
+step. `script.name` is `null` unless llmsim was booted the normal way
+(`sbt run` / the Docker images) — in-process tests that build an `App`
+directly without going through `Main` don't have a class name to report.
+
+`GET /_llmsim/dashboard` sends `Cache-Control: no-store` — this is meant
+to be polled live, not cached by anything sitting between the page and
+llmsim.
+
+```bash
+open http://localhost:8089/_llmsim/ui
+```
+
+`GET /_llmsim/ui` serves a single static HTML page — no build step, no
+framework — that polls the JSON above every couple of seconds and
+renders it. It shows a "last refreshed" timestamp and a visible error
+banner if a poll fails, specifically so a broken connection reads as
+"this is stale," not as a dashboard that's silently frozen while still
+looking valid.
+
 ## Using llmsim in an app's end-to-end tests
 
 Everything above is standalone: curl against a running llmsim, no other
@@ -612,7 +684,11 @@ src/main/scala/com/alai/llmsim/
   ScriptRunner.scala     -- advances through a Script's steps, one per call
   CallJournal.scala      -- records every call for later inspection
   Simulator.scala        -- http4s routes: /v1/chat/completions, /v1/messages
-  ManagementRoutes.scala -- test-harness routes: /_llmsim/calls, /status, /reset
+  ManagementRoutes.scala -- test-harness routes: /_llmsim/calls, /status,
+                             /reset, /dashboard, /ui
+  Dashboard.scala        -- the dashboard's data model, aggregation, and
+                             embedded HTML page (ManagementRoutes calls
+                             into this; keeps routing and rendering separate)
   App.scala              -- combines both route sets into one HttpApp
   Main.scala             -- loads a script by name (LLMSIM_SCRIPT) and serves it
   scripts/
@@ -623,6 +699,8 @@ src/main/scala/com/alai/llmsim/
 
 src/test/scala/com/alai/llmsim/
   SimulatorSpec.scala           -- in-process tests of the simulator itself
+  DashboardSpec.scala           -- Dashboard's pure aggregation function,
+                                    ScriptRunner.status, and the two routes
   PublishedApiContractSpec.scala -- checks our case classes decode example
                                      payloads shaped like each vendor's own
                                      published API docs (no network, no keys)
@@ -644,6 +722,15 @@ ci/
                              "Releasing new versions" below, and
                              "Running ci/spring-verification locally"
                              under "Testing" to run it yourself.
+
+docs/
+  dashboard-design.md    -- design record for the dashboard: the JSON
+                             contract, why ScriptStatus exists instead of
+                             exposing ScriptRunner's raw position, and the
+                             reasoning behind a couple of things that
+                             changed after review. Not user documentation
+                             (see "Dashboard" above for that) -- this is
+                             the "why," kept separate from the "how."
 ```
 
 ## Running locally
@@ -780,7 +867,7 @@ push ran anything.
 
     ~~Non-streaming tool-callback baseline~~ — done, ahead of the streaming work: `openAiToolCallRoundTripActuallyExecutesAndAnswers` registers a real Java `@Tool` on its own dedicated `ChatClient` (nothing global, so no other test risks auto-executing a tool call it only means to inspect), and confirms the full loop — llmsim returns a tool call, Spring AI actually invokes the callback, the real return value comes back in the follow-up request, `replyFromToolResult` answers from it. `openAiShapedClientSurfacesTheToolCall` (no tool registered) still covers the narrower "Spring AI parsed the block" case on its own. Having this pass first meant a streamed-tool-call failure would have been clearly an SSE problem, not an ambiguous one.
 
-13. Bare-bones dashboard — a plain JSON endpoint (`GET /_llmsim/dashboard`) rendered by a single static HTML page served alongside the API, no build step or framework. Makes call outcomes and latency visible while streaming and fault injection are still being iterated on — not a final UI, and not a substitute for item 12's real-client verification.
+13. ~~Bare-bones dashboard~~ — done: `GET /_llmsim/dashboard` (a journal-window JSON summary — script progress, call counts by outcome/provider, streamed count, nearest-rank latency percentiles) and `GET /_llmsim/ui` (a single static HTML page, no build step, that polls and renders it). `ScriptRunner` gained a `status` method returning a `ScriptStatus` snapshot (total/next step, overrun policy, exhausted) rather than exposing its raw internal position, which turned out to be genuinely ambiguous from outside without also knowing the overrun policy — see `docs/dashboard-design.md` for the full reasoning. Not a substitute for `ci/spring-verification`'s real-client checks, and not the final UI — the real Angular console (item 16) will eventually replace the page at the same `/_llmsim/ui` path.
 14. Streaming fault injection: delayed first token, delayed inter-token gaps, mid-stream disconnect, malformed SSE event, stream ending without a completion event, tool-call arguments split across chunks, and HTTP 429 before streaming begins. Validated against the item 13 dashboard as each fault type is added, and extend `ci/spring-verification` (item 12) to cover the fault types that matter most for a real client (mid-stream disconnect, split tool-call arguments). This is also where `CallJournal`'s record-on-completion model is worth revisiting toward a `begin`/`complete`/`fail`/`cancel` lifecycle — deliberately not built for item 12, since a fully scripted, non-delayed stream has no genuine in-flight/cancelled state to represent yet, but delayed and disconnectable streams do.
 15. `GET /v1/models`.
 16. The real Angular console (`console-angular/`), served by the standalone image at `/_llmsim/ui`, with overview/calls/timeline/streaming views as designed. Deliberately last — the data model (streams, faults) needs to be settled first so the UI is built once against a stable shape instead of reworked mid-flight.
