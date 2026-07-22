@@ -4,16 +4,27 @@ import com.alai.llmsim.{Script, ScriptSource}
 import com.alai.llmsim.Script._
 
 /** Boots llmsim for ci/spring-verification (see VerificationTest there).
-  * Four steps, each consumed by exactly one test, in order, with no
+  * Six steps, each consumed by exactly one test, in order, with no
   * warmup or discard calls:
   *   0. A plain text reply -- OpenAI-shaped basic ChatClient check.
   *   1. The same reply again -- Anthropic-shaped basic ChatClient check
   *      (its own step, since this design is one call per test).
   *   2. A tool call -- proves a tool_calls/tool_use block round-trips
-  *      correctly through a real client.
+  *      correctly through a real client. No tool is registered for this
+  *      one on purpose: it only checks that Spring AI *parsed* the
+  *      block, not that anything got executed.
   *   3. A reply carrying rate-limit-shaped headers for both providers --
   *      proves (or, for OpenAI, documents the current gap in) Spring
   *      AI's ChatResponseMetadata#getRateLimit().
+  *   4. A second, distinct tool call, together with step 5 --
+  *   5. -- a reply built from the REAL tool result: the non-streaming
+  *      baseline round trip (llmsim returns a tool call, a real
+  *      registered Java @Tool actually executes, its real return value
+  *      comes back as the follow-up request's tool result, and this
+  *      step answers from that). Establishing this now, before SSE,
+  *      means a streamed-tool-call failure later is clearly an SSE
+  *      problem, not an ambiguous "is it the tool loop or the stream"
+  *      one.
   *
   * Kept in llmsim's own scripts package, not the verification module,
   * since Main loads scripts by fully-qualified name off llmsim's own
@@ -34,6 +45,8 @@ object VerificationFlow extends ScriptSource {
         "anthropic-ratelimit-requests-remaining"   -> "999",
         "anthropic-ratelimit-requests-reset"       -> "2026-07-21T19:00:00Z"
       )
-    )
+    ),
+    toolCall(id = "call-2", name = "get_weather", arguments = """{"city":"Boston"}"""),
+    replyFromToolResult("call-2")(result => s"Here's what the tool reported: $result")
   )
 }

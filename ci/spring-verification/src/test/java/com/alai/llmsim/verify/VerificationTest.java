@@ -41,8 +41,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * warmups, no discards, no room for retry amplification to matter.
  *
  * Requires llmsim running with
- * LLMSIM_SCRIPT=com.alai.llmsim.scripts.VerificationFlow, whose four
- * steps this class's five tests (the fifth disabled) consume in order.
+ * LLMSIM_SCRIPT=com.alai.llmsim.scripts.VerificationFlow, whose six
+ * steps this class's six tests (the fifth disabled) consume in order.
  */
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 @SpringBootTest(classes = VerificationApplication.class)
@@ -117,5 +117,33 @@ class VerificationTest {
         var response = ChatClient.create(openAiChatModel).prompt("hello").call().chatResponse();
         RateLimit rateLimit = response.getMetadata().getRateLimit();
         assertThat(rateLimit.getRequestsRemaining()).isEqualTo(59L);
+    }
+
+    @Order(6)
+    @Test
+    void openAiToolCallRoundTripActuallyExecutesAndAnswers() {
+        // VerificationFlow steps 4 and 5: llmsim returns a tool call,
+        // a REAL Java @Tool actually executes (not just "Spring AI
+        // parsed the block" -- that's step 3's
+        // openAiShapedClientSurfacesTheToolCall, no tool registered
+        // there on purpose), its real return value comes back in the
+        // follow-up request, and llmsim's replyFromToolResult answers
+        // from that real value. A dedicated ChatClient with the tool
+        // registered is built here rather than reusing the shared
+        // field, so no other test in this class risks auto-executing a
+        // tool call it only means to inspect.
+        //
+        // The prompt text itself is irrelevant to what llmsim returns --
+        // llmsim is entirely script-position-driven, it never reads the
+        // prompt -- kept generic on purpose so that isn't implied.
+        WeatherTool weatherTool = new WeatherTool();
+        ChatClient client = ChatClient.builder(openAiChatModel)
+                .defaultTools(weatherTool)
+                .build();
+
+        String answer = client.prompt("what's the weather like?").call().content();
+
+        assertThat(weatherTool.lastCity()).isEqualTo("Boston");
+        assertThat(answer).contains("72F and sunny in Boston");
     }
 }
