@@ -15,7 +15,9 @@ import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.ai.openai.OpenAiChatModel;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import reactor.core.publisher.Flux;
 
+import java.time.Duration;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -41,8 +43,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * warmups, no discards, no room for retry amplification to matter.
  *
  * Requires llmsim running with
- * LLMSIM_SCRIPT=com.alai.llmsim.scripts.VerificationFlow, whose six
- * steps this class's six tests (the fifth disabled) consume in order.
+ * LLMSIM_SCRIPT=com.alai.llmsim.scripts.VerificationFlow, whose nine
+ * steps this class's nine tests (the fifth disabled) consume in order.
  */
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 @SpringBootTest(classes = VerificationApplication.class)
@@ -145,5 +147,75 @@ class VerificationTest {
 
         assertThat(weatherTool.lastCity()).isEqualTo("Boston");
         assertThat(answer).contains("72F and sunny in Boston");
+    }
+
+    @Order(7)
+    @Test
+    void openAiShapedClientStreamsTheScriptedReply() {
+        // VerificationFlow step 6. The real gate for llmsim's SSE work:
+        // not "does llmsim emit plausible-looking chunks" (llmsim's own
+        // SimulatorStreamingSpec-equivalent wire-level tests already
+        // cover that) but "does a real Spring AI ChatClient parse them
+        // and complete cleanly". collectList().block() rather than
+        // StepVerifier deliberately -- avoids adding reactor-test as a
+        // new pom dependency when plain reactor-core (already present
+        // transitively via Spring AI's WebClient usage) is enough to
+        // prove the stream both reconstructs correctly and completes.
+        Flux<String> stream = ChatClient.create(openAiChatModel).prompt("hello").stream().content();
+
+        List<String> tokens = stream.collectList().block(Duration.ofSeconds(10));
+
+        assertThat(tokens).isNotNull();
+        assertThat(String.join("", tokens)).isEqualTo("hello there world");
+    }
+
+    @Order(8)
+    @Test
+    void anthropicShapedClientStreamsTheScriptedReply() {
+        // VerificationFlow step 7 -- Anthropic's named-event SSE format
+        // is a genuinely different wire shape from OpenAI's data-only
+        // chunks, parsed by different Spring AI client code, so this is
+        // not a redundant check against the OpenAI streaming test above.
+        Flux<String> stream = ChatClient.create(anthropicChatModel).prompt("hello").stream().content();
+
+        List<String> tokens = stream.collectList().block(Duration.ofSeconds(10));
+
+        assertThat(tokens).isNotNull();
+        assertThat(String.join("", tokens)).isEqualTo("hello there world");
+    }
+
+    @Order(9)
+    @Test
+    void openAiShapedClientSurfacesTheStreamedToolCall() {
+        // VerificationFlow step 8. Lower-level ChatModel API, no
+        // registered tool callback -- same reasoning as step 3's
+        // non-streaming openAiShapedClientSurfacesTheToolCall: this
+        // checks the tool_calls block round-trips correctly once the
+        // stream completes, not that Spring AI can auto-invoke it. A
+        // full streamed tool-callback round trip (mirroring
+        // openAiToolCallRoundTripActuallyExecutesAndAnswers, but over a
+        // stream) is deliberately not attempted here -- see
+        // VerificationFlow's Javadoc for why that's its own follow-up.
+        Prompt prompt = new Prompt(List.of(new UserMessage("what is the weather in Seattle?")));
+        Flux<ChatResponse> stream = openAiChatModel.stream(prompt);
+
+        List<ChatResponse> chunks = stream.collectList().block(Duration.ofSeconds(10));
+
+        assertThat(chunks).isNotNull().isNotEmpty();
+
+        // Searching all chunks rather than assuming the tool call lands
+        // in a specific one (e.g. the last) -- deliberately not assuming
+        // whether Spring AI accumulates streaming deltas into each
+        // emitted ChatResponse or passes raw per-chunk deltas straight
+        // through; either way, the tool call must show up somewhere.
+        ChatResponse toolCallChunk = chunks.stream()
+                .filter(c -> c.getResult() != null && c.getResult().getOutput() != null
+                        && c.getResult().getOutput().hasToolCalls())
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("no chunk in the stream carried a tool call: " + chunks));
+
+        assertThat(toolCallChunk.getResult().getOutput().getToolCalls().get(0).name()).isEqualTo("get_weather");
+        assertThat(toolCallChunk.getResult().getOutput().getToolCalls().get(0).arguments())
+                .isEqualTo("{\"city\":\"Seattle\"}");
     }
 }
