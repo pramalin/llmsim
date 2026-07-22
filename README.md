@@ -21,7 +21,33 @@ curl -s -X POST http://localhost:8089/v1/chat/completions \
 ```
 
 **1. The default script.** You should get back `"This is a simulated
-response."` in `choices[0].message.content`.
+response."` in `choices[0].message.content`:
+
+```json
+{
+  "id": "chatcmpl-sim-3f9a2b7e-2c31-4b9a-9e2a-6b7f1a2c3d4e",
+  "object": "chat.completion",
+  "created": 1732000000,
+  "model": "gpt-4o-mini",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "This is a simulated response.",
+        "tool_calls": null,
+        "tool_call_id": null
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": { "prompt_tokens": 1, "completion_tokens": 5, "total_tokens": 6 }
+}
+```
+
+(`id`, `created`, and `usage` vary between runs — `usage` is a simple
+word-count heuristic unless the script pins exact values, see "Usage
+counts" below.)
 
 The Anthropic-shaped endpoint answers from the same running instance, but
 the request shape itself is different — `max_tokens` is required, and
@@ -40,7 +66,21 @@ curl -s -X POST http://localhost:8089/v1/messages \
   }'
 ```
 
-Same reply, now in `content[0].text`, with `stop_reason: "end_turn"`.
+Same reply, now in `content[0].text`, with `stop_reason: "end_turn"`:
+
+```json
+{
+  "id": "msg-sim-8a1c4d2e-9f3b-4c5a-b6d7-1e2f3a4b5c6d",
+  "type": "message",
+  "role": "assistant",
+  "content": [
+    { "type": "text", "text": "This is a simulated response." }
+  ],
+  "model": "claude-sonnet-5",
+  "stop_reason": "end_turn",
+  "usage": { "input_tokens": 1, "output_tokens": 5 }
+}
+```
 
 **2. The example script.** `Default` and `WeatherFlow` are both already
 built into the image, so switching is just a restart with a different
@@ -105,7 +145,40 @@ curl -s -X POST http://localhost:8089/v1/chat/completions \
 
 Look at `choices[0].message.tool_calls` — you should see a call to
 `get_weather` with `arguments: "{\"city\":\"San Francisco\"}"`, and
-`finish_reason: "tool_calls"`. Now send the follow-up call an app would
+`finish_reason: "tool_calls"`:
+
+```json
+{
+  "id": "chatcmpl-sim-c1d2e3f4-5a6b-7c8d-9e0f-1a2b3c4d5e6f",
+  "object": "chat.completion",
+  "created": 1732000010,
+  "model": "gpt-4o-mini",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "id": "call-1",
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "arguments": "{\"city\":\"San Francisco\"}"
+            }
+          }
+        ],
+        "tool_call_id": null
+      },
+      "finish_reason": "tool_calls"
+    }
+  ],
+  "usage": { "prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10 }
+}
+```
+
+Now send the follow-up call an app would
 send, carrying a (made-up, for this example) tool result:
 
 ```bash
@@ -125,7 +198,31 @@ curl -s -X POST http://localhost:8089/v1/chat/completions \
 
 `choices[0].message.content` should now say `"Here's what the tool
 reported: 68F and foggy"` — built from the tool result *you* put in that
-request, not a fixed string. That's `replyFromToolResult` at work: llmsim
+request, not a fixed string:
+
+```json
+{
+  "id": "chatcmpl-sim-a7b8c9d0-1e2f-3a4b-5c6d-7e8f9a0b1c2d",
+  "object": "chat.completion",
+  "created": 1732000011,
+  "model": "gpt-4o-mini",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Here's what the tool reported: 68F and foggy",
+        "tool_calls": null,
+        "tool_call_id": null
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": { "prompt_tokens": 8, "completion_tokens": 7, "total_tokens": 15 }
+}
+```
+
+That's `replyFromToolResult` at work: llmsim
 never called `get_weather` itself, it just read the value back out of
 your request the same way it would from a real app's real tool call.
 
@@ -461,8 +558,14 @@ ci/
                              real Spring AI client correctly parses what
                              llmsim sends -- llmsim's own tests can only
                              assert what it sent, not that a real client
-                             parsed it. Both are release gates; see
-                             "Releasing new versions" below.
+                             parsed it. Includes a real, registered
+                             Java @Tool (WeatherTool) for a full
+                             non-streaming tool-callback round trip, not
+                             just checking that a tool_calls block was
+                             parsed. Both are release gates; see
+                             "Releasing new versions" below, and
+                             "Running ci/spring-verification locally"
+                             under "Testing" to run it yourself.
 ```
 
 ## Running locally
@@ -542,6 +645,33 @@ exercises the routes in-process, and `PublishedApiContractSpec` checks our
 case classes against example payloads shaped like each vendor's published
 docs rather than making a live call.
 
+### Running ci/spring-verification locally
+
+`sbt test` never makes a real Spring AI call, so it can't tell you
+whether a real client actually parses what llmsim sends — that's what
+`ci/spring-verification` is for (see "Layout" above). It needs a running
+llmsim instance, booted with the specific script its tests expect:
+
+```bash
+# terminal 1 -- boot llmsim with the script ci/spring-verification runs against
+LLMSIM_SCRIPT=com.alai.llmsim.scripts.VerificationFlow sbt run
+```
+
+Wait for the boot log to say `booting with script
+'com.alai.llmsim.scripts.VerificationFlow'` — if it says `Default`
+instead, the `LLMSIM_SCRIPT` environment variable didn't take effect and
+every test will fail against the wrong script.
+
+```bash
+# terminal 2, once llmsim is up
+cd ci/spring-verification
+mvn test
+```
+
+If you've changed a `.java` file and Maven says `Nothing to compile - all
+classes are up to date` without picking it up, run `mvn clean test`
+instead — Maven's staleness check has been wrong about this before.
+
 Every push to `main` and every pull request also runs the full gate
 (`.github/workflows/ci.yml`): the test suite, the `ci/smoke-test/`
 extension-pattern check, and `ci/spring-verification`'s real Spring AI
@@ -566,7 +696,9 @@ push ran anything.
 
 12. Streaming responses (SSE) — a new release cycle, for both OpenAI- and Anthropic-shaped endpoints, enough of each vendor's real wire format to exercise Spring AI's `ChatClient` `Flux<String>` / `Flux<ChatResponse>` streaming paths.
 
-    **Definition of done extends `ci/spring-verification` rather than creating a new module.** llmsim can assert that it *sent* well-formed SSE; it can't assert that a real Spring AI `ChatClient` *parsed* it correctly. Since that module and its CI gate already exist, this step adds streaming test cases to it — normal token-by-token streaming completing cleanly, a mid-stream disconnect surfacing as the correct exception, a tool call's arguments reassembling correctly — rather than standing up a second verification harness. Before the tool-call-streaming portion specifically, add one non-streaming baseline first: a real registered `@Tool` callback round trip (llmsim returns a tool call → Spring AI actually invokes the Java callback → sends the real result back → `replyFromToolResult` answers) — today's tool-call test deliberately stops at "Spring AI parsed the tool_calls block," short of execution, and having that baseline pass first means a streamed-tool-call failure later is clearly an SSE problem, not an ambiguous one.
+    **Definition of done extends `ci/spring-verification` rather than creating a new module.** llmsim can assert that it *sent* well-formed SSE; it can't assert that a real Spring AI `ChatClient` *parsed* it correctly. Since that module and its CI gate already exist, this step adds streaming test cases to it — normal token-by-token streaming completing cleanly, a mid-stream disconnect surfacing as the correct exception, a tool call's arguments reassembling correctly — rather than standing up a second verification harness.
+
+    ~~Non-streaming tool-callback baseline~~ — done, ahead of the streaming work: `openAiToolCallRoundTripActuallyExecutesAndAnswers` registers a real Java `@Tool` on its own dedicated `ChatClient` (nothing global, so no other test risks auto-executing a tool call it only means to inspect), and confirms the full loop — llmsim returns a tool call, Spring AI actually invokes the callback, the real return value comes back in the follow-up request, `replyFromToolResult` answers from it. `openAiShapedClientSurfacesTheToolCall` (no tool registered) still covers the narrower "Spring AI parsed the block" case on its own. Having this pass first means a streamed-tool-call failure later is clearly an SSE problem, not an ambiguous one.
 
 13. Bare-bones dashboard — a plain JSON endpoint (`GET /_llmsim/dashboard`) rendered by a single static HTML page served alongside the API, no build step or framework. Makes call outcomes and latency visible while streaming and fault injection are still being iterated on — not a final UI, and not a substitute for item 12's real-client verification.
 14. Streaming fault injection: delayed first token, delayed inter-token gaps, mid-stream disconnect, malformed SSE event, stream ending without a completion event, tool-call arguments split across chunks, and HTTP 429 before streaming begins. Validated against the item 13 dashboard as each fault type is added, and extend `ci/spring-verification` (item 12) to cover the fault types that matter most for a real client (mid-stream disconnect, split tool-call arguments). This is also where `CallJournal`'s record-on-completion model is worth revisiting toward a `begin`/`complete`/`fail`/`cancel` lifecycle — deliberately not built for item 12, since a fully scripted, non-delayed stream has no genuine in-flight/cancelled state to represent yet, but delayed and disconnectable streams do.
