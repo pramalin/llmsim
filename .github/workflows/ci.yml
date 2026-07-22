@@ -1,0 +1,103 @@
+name: CI
+
+# Runs on every push to main and every pull request -- unlike
+# publish.yml (triggered only by a version tag), this is what actually
+# tests ordinary commits. Mirrors publish.yml's test/smoke-test/
+# spring-verification gates, minus anything that pushes or requires a
+# version number, since neither exists on a plain commit. Not yet
+# extracted into a shared reusable workflow with publish.yml -- these
+# two are kept separately maintained for now to avoid touching the
+# already-verified publish.yml in the same change; worth revisiting if
+# they start to drift.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Run the test suite
+        run: docker build --target test .
+
+      - name: Build llmsim-build (local only, not pushed)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: build
+          push: false
+          load: true
+          tags: llmsim-build:ci
+
+      - name: Build the consumer smoke-test fixture against it
+        run: |
+          docker build \
+            --build-arg LLMSIM_BUILD_IMAGE=llmsim-build:ci \
+            -t llmsim-smoke-test \
+            ci/smoke-test
+
+      - name: Run the fixture and verify the documented extension pattern actually works
+        run: |
+          docker run -d --name llmsim-smoke -p 18089:8089 llmsim-smoke-test
+
+          for i in $(seq 1 20); do
+            curl -sf http://localhost:18089/_llmsim/calls > /dev/null && break
+            sleep 1
+          done
+
+          RESPONSE=$(curl -sf -X POST http://localhost:18089/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hello"}]}')
+          echo "$RESPONSE"
+          echo "$RESPONSE" | grep -q "smoke test ok"
+
+          curl -sf http://localhost:18089/_llmsim/calls | grep -q "smoke test ok"
+
+          docker logs llmsim-smoke
+          docker rm -f llmsim-smoke
+
+      - name: Build the standalone runtime image (local only, not pushed)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: llmsim:ci
+
+      - name: Boot it with the verification script
+        run: |
+          docker run -d --name llmsim-verify -p 28089:8089 \
+            -e LLMSIM_SCRIPT=com.alai.llmsim.scripts.VerificationFlow \
+            llmsim:ci
+
+          for i in $(seq 1 20); do
+            curl -sf http://localhost:28089/_llmsim/calls > /dev/null && break
+            sleep 1
+          done
+
+      - name: Set up JDK for ci/spring-verification
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Run ci/spring-verification against it
+        working-directory: ci/spring-verification
+        env:
+          LLMSIM_OPENAI_BASE_URL: http://localhost:28089/v1
+          LLMSIM_ANTHROPIC_BASE_URL: http://localhost:28089
+        run: mvn -B test
+
+      - name: Tear down the verification container
+        if: always()
+        run: |
+          docker logs llmsim-verify || true
+          docker rm -f llmsim-verify || true
