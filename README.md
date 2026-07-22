@@ -188,6 +188,47 @@ exactly the way it would hand that value to a real LLM. If no tool_result
 matching `toolCallId` shows up in the request, it fails loudly rather than
 guessing.
 
+### Usage counts
+
+Every `reply`, `toolCall`, and `replyFromToolResult` step reports token
+usage by default from a simple word-count heuristic — not a real
+tokenizer, just enough that `usage` in the response has *something*
+plausible in it. Pin exact counts instead when a test needs to hit a
+specific token-budget boundary precisely:
+
+```scala
+reply("hello", usage = usage(promptTokens = 3900, completionTokens = 50))
+```
+
+The same `promptTokens`/`completionTokens` pair maps onto both wire
+shapes: OpenAI's `usage.prompt_tokens`/`usage.completion_tokens` and
+Anthropic's `usage.input_tokens`/`usage.output_tokens`.
+
+### Response headers
+
+Any step can also carry raw HTTP response headers, returned verbatim —
+most commonly rate-limit headers or `retry-after` on an `error(...)`
+step:
+
+```scala
+Script.exactly(
+  reply("first answer", headers = Map(
+    "x-ratelimit-remaining-requests" -> "2",
+    "x-ratelimit-reset-requests"     -> "10s"
+  )),
+  error(429, "rate limit exceeded", headers = Map(
+    "retry-after"                    -> "5",
+    "x-ratelimit-remaining-requests" -> "0"
+  ))
+)
+```
+
+Deliberately raw strings, not a structured rate-limit type: OpenAI's
+reset values are its own compact duration format (`"6m0s"`) and
+Anthropic's are RFC 3339 timestamps — two genuinely different wire
+formats, so the script controls the exact value that goes out rather
+than llmsim deciding how to translate between them.
+
 ## Inspecting captured calls
 
 Every call the simulator receives is recorded — provider, a normalized
@@ -210,10 +251,20 @@ curl -s http://localhost:8089/_llmsim/calls
     "rawRequest": { "model": "gpt-4o-mini", "messages": [ ... ] },
     "outcome": { "type": "responded", "status": 200, "body": { ... } },
     "stepIndex": 0,
-    "receivedAtEpochMillis": 1732000000000
+    "receivedAtEpochMillis": 1732000000000,
+    "completedAtEpochMillis": 1732000000012,
+    "durationMillis": 12
   }
 ]
 ```
+
+`receivedAtEpochMillis`/`completedAtEpochMillis` are real (wall-clock)
+timestamps, captured at the very top of the route before the request
+body is even decoded and just before the response is returned.
+`durationMillis` comes from a separate monotonic clock reading, not from
+subtracting the two epoch timestamps — wall-clock time can jump (NTP
+adjustment, clock skew) and is the wrong source for measuring elapsed
+duration.
 
 `outcome.type` is one of:
 - `"responded"` — answered normally; `body` is the exact response sent.
@@ -283,7 +334,7 @@ against it rather than it being something already fully built. Your own
 project's script never needs to live inside llmsim's repo, and llmsim's
 engine source never needs to be copied into yours.
 
-**Pin a released version** (`llmsim-build:0.1.0`, as below) in application
+**Pin a released version** (`llmsim-build:0.1.1`, as below) in application
 repositories — an unrelated llmsim release shouldn't be able to break your
 build out from under you. `:latest` exists for quickly evaluating llmsim
 itself, not for building on top of.
@@ -292,7 +343,7 @@ Your project gets its own tiny `Dockerfile` (e.g. `llmsim/Dockerfile` in
 your repo) that layers just your script on top of the published engine:
 
 ```dockerfile
-FROM ghcr.io/pramalin/llmsim-build:0.1.0 AS build
+FROM ghcr.io/pramalin/llmsim-build:0.1.1 AS build
 COPY AnalyticsFlow.scala /build/src/main/scala/com/example/agenticanalytics/llmsim/AnalyticsFlow.scala
 RUN sbt assembly
 
@@ -372,7 +423,8 @@ src/main/scala/com/alai/llmsim/
   Protocol.scala        -- case classes for OpenAI ChatRequest/Response and
                             Anthropic MessagesRequest/Response, plus their
                             error-response shapes, with circe codecs inline
-  Script.scala           -- the DSL: Step, Overrun, Script, ScriptSource
+  Script.scala           -- the DSL: Step, Overrun, Script, ScriptSource,
+                            UsageOverride
   ScriptRunner.scala     -- advances through a Script's steps, one per call
   CallJournal.scala      -- records every call for later inspection
   Simulator.scala        -- http4s routes: /v1/chat/completions, /v1/messages
@@ -382,12 +434,26 @@ src/main/scala/com/alai/llmsim/
   scripts/
     Default.scala        -- the built-in fallback script
     WeatherFlow.scala    -- an example fixed multi-call sequence
+    ToolCallFlow.scala   -- an example tool-call round trip
+    VerificationFlow.scala -- what ci/spring-verification runs against
 
 src/test/scala/com/alai/llmsim/
   SimulatorSpec.scala           -- in-process tests of the simulator itself
   PublishedApiContractSpec.scala -- checks our case classes decode example
                                      payloads shaped like each vendor's own
                                      published API docs (no network, no keys)
+
+ci/
+  smoke-test/            -- a tiny fixture project proving the documented
+                             Pattern A extension mechanism (build FROM
+                             llmsim-build, add one script, sbt assembly)
+                             actually still works against a given image
+  spring-verification/   -- a minimal Spring Boot + Maven module proving a
+                             real Spring AI client correctly parses what
+                             llmsim sends -- llmsim's own tests can only
+                             assert what it sent, not that a real client
+                             parsed it. Both are release gates; see
+                             "Releasing new versions" below.
 ```
 
 ## Running locally
@@ -426,17 +492,26 @@ Pushing a version tag publishes both images to GHCR automatically (see
 `.github/workflows/publish.yml`):
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.2
+git push origin v0.1.2
 ```
 
-This runs the full test suite, builds `ghcr.io/pramalin/llmsim-build:0.1.0`
-and runs a consumer smoke test against it (`ci/smoke-test/`) — a tiny
-fixture script, built and run exactly the way a real consuming project's
-Dockerfile would, proving the documented Pattern A extension mechanism
-actually still works against this exact image. Only if the tests and the
-smoke test both pass does anything get pushed: `llmsim-build:0.1.0` and
-`llmsim:0.1.0` (the standalone image), each also tagged `:latest`.
+This runs the full test suite, then gates the push on two independent
+checks against the images about to ship, not just against llmsim's own
+source:
+
+- **`ci/smoke-test/`** — a tiny fixture built from `llmsim-build`, proving
+  the documented Pattern A extension mechanism (layer one script on top,
+  `sbt assembly`) still works against this exact image.
+- **`ci/spring-verification/`** — the standalone image, booted with the
+  bundled `VerificationFlow` script, checked against a real Spring AI
+  client (`mvn test`) rather than llmsim's own assertions about what it
+  sent. This is the check that a real consumer can actually parse
+  llmsim's responses, not just that llmsim believes they're well-formed.
+
+Only if the tests and both gates pass does anything get pushed:
+`llmsim-build:<version>` and `llmsim:<version>` (the standalone image),
+each also tagged `:latest`.
 
 ## Testing
 
@@ -456,27 +531,20 @@ docs rather than making a live call.
 3. ~~Captured-call journal~~ — done (`/_llmsim/calls`, `/_llmsim/status`, `/_llmsim/reset`)
 4. ~~Tool-call round trips~~ — done (`toolCall`, and `replyFromToolResult` to build a reply from the app's real tool result rather than a fixed string)
 5. ~~Published, reusable distribution~~ — done (`ghcr.io/pramalin/llmsim-build` as a dependency for consuming projects, `ghcr.io/pramalin/llmsim` standalone)
+6. ~~Duration and correlation fields on `CapturedCall`~~ — done: `receivedAtEpochMillis`/`completedAtEpochMillis`, with a monotonic-clock-derived `durationMillis`. Concurrent test isolation is handled outside llmsim (an ephemeral instance per test class, or `/_llmsim/reset` for a shared long-lived one) rather than with an in-process session concept — an earlier draft of this item planned a custom `X-LLMSIM-SESSION` header for that, which was deliberately dropped in favor of not pushing an llmsim-specific concept into application/test code.
+7. ~~Scriptable usage counts and response headers~~ — done: `usage(promptTokens, completionTokens)` on any step for pinning exact token counts, and raw `headers` on any step for rate-limit headers, `retry-after`, or anything else — see "Writing a script" above.
+8. ~~Plan and scope a sample Spring AI verification module~~ — done, as `ci/spring-verification/`.
+9. ~~Build it~~ — done: a minimal Spring Boot + Maven module (`ci/spring-verification/`) proving a real Spring AI client (both OpenAI- and Anthropic-shaped) correctly parses what llmsim sends, including a `@Disabled` test tracking [spring-projects/spring-ai#6607](https://github.com/spring-projects/spring-ai/issues/6607) (OpenAI rate-limit headers aren't wired into `ChatResponseMetadata` as of Spring AI 2.0.0 — an upstream gap, not an llmsim one). Wired into `.github/workflows/publish.yml` as a release gate alongside the existing smoke test.
+10. ~~Cut a release~~ — done, `v0.1.1`: items 6–9 above, a real usable release on its own, none of it depending on SSE existing.
 
-6. **Simple enhancements** — no UI dependency, no streaming dependency, ships as one commit ahead of everything below:
-   - Duration and correlation fields on `CapturedCall`: `receivedAtEpochMillis` / `completedAtEpochMillis` (with a derived `durationMillis`), plus a `sessionId` field.
-   - Per-test-run session isolation, keyed by an `X-LLMSIM-SESSION` request header, so concurrent tests don't share one script position (currently global to the process).
+11. Streaming responses (SSE) — a new release cycle starting fresh from `v0.1.1`, for both OpenAI- and Anthropic-shaped endpoints, enough of each vendor's real wire format to exercise Spring AI's `ChatClient` `Flux<String>` / `Flux<ChatResponse>` streaming paths.
 
-   These two are bundled into one step because they touch the same `CapturedCall`/`ScriptRunner` surface — doing them together avoids changing that schema twice. This is deliberately sequenced *before* streaming (item 10): streaming introduces its own mutable per-call state (stream position, disconnect/fault status), and isolating that per-session is materially harder to retrofit after the fact than to design in from the start.
+    **Definition of done extends `ci/spring-verification` rather than creating a new module.** llmsim can assert that it *sent* well-formed SSE; it can't assert that a real Spring AI `ChatClient` *parsed* it correctly. Since that module and its CI gate already exist, this step adds streaming test cases to it — normal token-by-token streaming completing cleanly, a mid-stream disconnect surfacing as the correct exception, a tool call's arguments reassembling correctly — rather than standing up a second verification harness.
 
-7. **Plan and scope a sample Spring AI verification module** — a design pass, no code yet: what it proves at this stage (a real Spring AI `ChatClient` call and a tool-call round trip against llmsim's *current*, non-streaming capabilities), where it lives (`ci/spring-verification/`, alongside the existing `ci/smoke-test/`), what it deliberately excludes (no MCP, no tool execution beyond what `ToolCallFlow` already covers, no UI), and how it's gated in CI. Written up as its own short doc so the scope is agreed before any code exists.
-
-8. **Build the sample app per that scope** — a minimal Spring Boot + Gradle module implementing exactly what item 7 scoped: proof that a real Spring AI client can talk to llmsim correctly, on today's non-streaming wire format. Wired into `.github/workflows/publish.yml` as a release gate alongside the existing smoke test.
-
-9. **Cut a release** — tags a version shipping items 6–8: the `CapturedCall` fields, session isolation, updated docs, and the sample verification module (still non-streaming). This is a real, usable release on its own — none of it depends on SSE existing.
-
-10. **Streaming responses (SSE)** — a new release cycle starting fresh from item 9's tag, for both OpenAI- and Anthropic-shaped endpoints, enough of each vendor's real wire format to exercise Spring AI's `ChatClient` `Flux<String>` / `Flux<ChatResponse>` streaming paths.
-
-    **Definition of done extends the item 7/8 sample module rather than creating a new one.** llmsim can assert that it *sent* well-formed SSE; it can't assert that a real Spring AI `ChatClient` *parsed* it correctly. Since the sample module and its CI gate already exist by this point (items 7–9), this step adds streaming test cases to it — normal token-by-token streaming completing cleanly, a mid-stream disconnect surfacing as the correct exception, a tool call's arguments reassembling correctly — rather than standing up a second verification harness. No other repository needs to exist or build for this item to be considered done.
-
-11. Bare-bones dashboard — plain JSON endpoints (`GET /_llmsim/dashboard`, `GET /_llmsim/sessions`) rendered by a single static HTML page served alongside the API, no build step or framework. Makes sessions, call outcomes, and latency visible while streaming and fault injection are still being iterated on — not a final UI, and not a substitute for item 10's real-client verification.
-12. Streaming fault injection: delayed first token, delayed inter-token gaps, mid-stream disconnect, malformed SSE event, stream ending without a completion event, tool-call arguments split across chunks, and HTTP 429 before streaming begins. Validated against the item 11 dashboard as each fault type is added, and extend the sample module (item 10) to cover the fault types that matter most for a real client (mid-stream disconnect, split tool-call arguments).
-13. `GET /v1/models`, token-usage refinements.
-14. The real Angular console (`console-angular/`), served by the standalone image at `/_llmsim/ui`, with overview/calls/timeline/sessions/streaming views as designed. Deliberately last — the data model (sessions, streams, faults) needs to be settled first so the UI is built once against a stable shape instead of reworked mid-flight.
+12. Bare-bones dashboard — a plain JSON endpoint (`GET /_llmsim/dashboard`) rendered by a single static HTML page served alongside the API, no build step or framework. Makes call outcomes and latency visible while streaming and fault injection are still being iterated on — not a final UI, and not a substitute for item 11's real-client verification.
+13. Streaming fault injection: delayed first token, delayed inter-token gaps, mid-stream disconnect, malformed SSE event, stream ending without a completion event, tool-call arguments split across chunks, and HTTP 429 before streaming begins. Validated against the item 12 dashboard as each fault type is added, and extend `ci/spring-verification` (item 11) to cover the fault types that matter most for a real client (mid-stream disconnect, split tool-call arguments).
+14. `GET /v1/models`.
+15. The real Angular console (`console-angular/`), served by the standalone image at `/_llmsim/ui`, with overview/calls/timeline/streaming views as designed. Deliberately last — the data model (streams, faults) needs to be settled first so the UI is built once against a stable shape instead of reworked mid-flight.
 
 `agentic-analytics` remains a pure downstream consumer throughout all of the above — it always pins a released `llmsim-build` tag (never a dev build), the same as any other project building on llmsim.
 
