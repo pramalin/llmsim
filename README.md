@@ -402,25 +402,29 @@ as they do non-streaming.
 ### Streaming fault injection
 
 Artificial delay is scriptable, attached to the same `reply`/`toolCall`/
-`replyFromToolResult` steps — nothing new to learn, and it's silently
-ignored on a non-streaming call to the same step, since delay only means
-something for SSE:
+`replyFromToolResult` steps — nothing new to learn, and `streamFault` has
+no effect on a non-streaming request to the same step, since delay only
+means something for SSE:
 
 ```scala
 reply("this arrives slowly",
   streamFault = streamFault(
-    delayBeforeFirstChunk = Some(2.seconds), // silence before ANY byte goes out
-    delayBetweenChunks    = Some(200.millis)  // then a gap before every frame after
+    delayBeforeFirstEvent = 2.seconds,  // silence before ANY byte goes out
+    delayBetweenEvents    = 200.millis  // then a gap before every frame after
   ))
 ```
 
-`delayBeforeFirstChunk` is a stand-in for real "time to first token"
-latency. `delayBetweenChunks` applies uniformly before *every* frame
-after the first — including the terminal one (OpenAI's `[DONE]`,
-Anthropic's `message_stop`) — a stand-in for a model that's slow to keep
-generating, not just slow to start. Both reject a negative duration at
-construction. Response headers are still set on the HTTP response
-immediately, regardless of either delay — only the body is slow.
+Delays apply between serialized SSE *events*, not just generated-text
+chunks — `delayBeforeFirstEvent` is a stand-in for real "time to first
+token" latency, and `delayBetweenEvents` applies uniformly before every
+event after the first, including provider protocol events (Anthropic's
+`message_start`, `content_block_start`, and so on) and the completion
+event itself (OpenAI's literal `[DONE]`, Anthropic's `message_stop`) —
+not only the ones carrying visible text. A stand-in for a model that's
+slow to keep generating, not just slow to start. Both reject a negative
+duration at construction. Response headers are still set on the HTTP
+response immediately, regardless of either delay — only the body is
+slow.
 
 This is the first of several planned fault types (see the Roadmap for
 what's still ahead: disconnects, malformed events, an omitted completion
@@ -900,7 +904,7 @@ push ran anything.
 13. ~~Bare-bones dashboard~~ — done: `GET /_llmsim/dashboard` (a journal-window JSON summary — script progress, call counts by outcome/provider, streamed count, nearest-rank latency percentiles) and `GET /_llmsim/ui` (a single static HTML page, no build step, that polls and renders it). `ScriptRunner` gained a `status` method returning a `ScriptStatus` snapshot (total/next step, overrun policy, exhausted) rather than exposing its raw internal position, which turned out to be genuinely ambiguous from outside without also knowing the overrun policy — see `docs/dashboard-design.md` for the full reasoning. Not a substitute for `ci/spring-verification`'s real-client checks, and not the final UI — the real Angular console (item 16) will eventually replace the page at the same `/_llmsim/ui` path.
 14. Streaming fault injection: delayed first token, delayed inter-token gaps, mid-stream disconnect, malformed SSE event, stream ending without a completion event, tool-call arguments split across chunks, and HTTP 429 before streaming begins. Validated against the item 13 dashboard as each fault type is added, and extend `ci/spring-verification` (item 12) to cover the fault types that matter most for a real client (mid-stream disconnect, split tool-call arguments). In progress, landing in stages:
     - ~~`CallJournal` lifecycle redesign~~ — done: `begin`/`complete` replacing the old single-shot `record`, a `Cancelled` outcome added, and stream completion tied to the frames stream's own `onFinalizeCase` rather than recorded eagerly before the response returns. See `docs/dashboard-design.md`'s sibling reasoning and the commit history for the full "why."
-    - ~~Delayed first token, delayed inter-token gaps~~ — done: `StreamFault(delayBeforeFirstChunk, delayBetweenChunks)`, attached to the same `reply`/`toolCall`/`replyFromToolResult` steps — see "Streaming fault injection" above.
+    - ~~Delayed first token, delayed inter-token gaps~~ — done: `StreamFault(delayBeforeFirstEvent, delayBetweenEvents)`, attached to the same `reply`/`toolCall`/`replyFromToolResult` steps — see "Streaming fault injection" above.
     - Mid-stream disconnect, an omitted completion event — next: where `CallOutcome.Cancelled` actually gets exercised for the first time.
     - Malformed SSE event, tool-call arguments split across chunks.
     - HTTP 429 before streaming begins needs no new mechanism at all — that's today's `Step.Error` used with a streaming request (an error never streams, matching real vendor behavior) — just a wire-level test confirming it, not new implementation.
