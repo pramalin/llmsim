@@ -19,28 +19,39 @@ final case class UsageOverride(promptTokens: Int, completionTokens: Int) {
 /** Artificial timing a script can attach to a streamed response --
   * ignored entirely for a non-streaming call to the same step, since
   * these are transport-level effects with nothing meaningful to mean
-  * outside SSE.
+  * outside SSE. "Fault" is the umbrella name for roadmap item 14 as a
+  * whole (disconnect, malformed events, an omitted completion event,
+  * and split tool-call arguments are the same case class's later
+  * fields, not new types) -- adding fields here as each one lands
+  * keeps every existing script, which never mentions StreamFault at
+  * all, compiling unchanged throughout. The delay fields specifically
+  * aren't inherently "faulty," though: a real model can legitimately
+  * be slow to start or slow to keep generating, and these two fields
+  * exist to represent that as much as any deliberately broken
+  * scenario.
   *
-  * Only delays for now (roadmap item 14's first stage); disconnect,
-  * malformed events, an omitted completion event, and split tool-call
-  * arguments are the same StreamFault case class's later fields, not a
-  * new type -- adding fields here as each one lands keeps every
-  * existing script (which never mentions StreamFault at all) compiling
-  * unchanged throughout.
+  * `delayBeforeFirstEvent`/`delayBetweenEvents` -- not "chunk": this
+  * delays serialized SSE frames uniformly, including provider protocol
+  * events (Anthropic's `message_start`, `content_block_start`, etc.)
+  * and the completion frame (OpenAI's literal `[DONE]`, Anthropic's
+  * `message_stop`), not only generated-text frames. "Chunk" reads as
+  * content-specific in a way the implementation isn't, especially for
+  * Anthropic, where several protocol events precede the first real
+  * text delta.
+  *
+  * Bare `FiniteDuration`s with `Duration.Zero` as the default, not
+  * `Option[FiniteDuration]`: a script never needs to say "no delay" by
+  * wrapping zero in `Some(...)`, and the DSL's own `streamFault(...)`
+  * helper (see below) takes ordinary durations for the same reason.
+  * The outer `Option[StreamFault]` on each step is a different
+  * question -- "was a fault configured at all" -- and stays optional.
   */
 final case class StreamFault(
-    // Silence before the FIRST frame goes out at all (including the
-    // role-announcing delta) -- a stand-in for real "time to first
-    // token" latency.
-    delayBeforeFirstChunk: Option[FiniteDuration] = None,
-    // Silence before every frame AFTER the first, applied uniformly --
-    // including before the terminal frame (OpenAI's literal [DONE], or
-    // Anthropic's message_stop) -- a stand-in for a model that's slow
-    // to keep generating, not just slow to start.
-    delayBetweenChunks: Option[FiniteDuration] = None
+    delayBeforeFirstEvent: FiniteDuration = Duration.Zero,
+    delayBetweenEvents: FiniteDuration = Duration.Zero
 ) {
-  delayBeforeFirstChunk.foreach(d => require(d >= Duration.Zero, s"delayBeforeFirstChunk must be >= 0, got $d"))
-  delayBetweenChunks.foreach(d => require(d >= Duration.Zero, s"delayBetweenChunks must be >= 0, got $d"))
+  require(delayBeforeFirstEvent >= Duration.Zero, s"delayBeforeFirstEvent must be >= 0, got $delayBeforeFirstEvent")
+  require(delayBetweenEvents >= Duration.Zero, s"delayBetweenEvents must be >= 0, got $delayBetweenEvents")
 }
 
 /** A single call gets answered by one Step.
@@ -150,15 +161,15 @@ object Script {
     Some(UsageOverride(promptTokens, completionTokens))
 
   // Same convenience pattern as usage(...) above: `reply("hi", streamFault =
-  // streamFault(delayBeforeFirstChunk = Some(2.seconds)))` instead of
+  // streamFault(delayBeforeFirstEvent = 2.seconds))` instead of
   // spelling out Some(StreamFault(...)) by hand. Only ever has an
   // observable effect on a streamed call to the same step -- see
   // StreamFault's own doc comment.
   def streamFault(
-      delayBeforeFirstChunk: Option[FiniteDuration] = None,
-      delayBetweenChunks: Option[FiniteDuration] = None
+      delayBeforeFirstEvent: FiniteDuration = Duration.Zero,
+      delayBetweenEvents: FiniteDuration = Duration.Zero
   ): Option[StreamFault] =
-    Some(StreamFault(delayBeforeFirstChunk, delayBetweenChunks))
+    Some(StreamFault(delayBeforeFirstEvent, delayBetweenEvents))
 }
 
 /** Every startup script is a Scala object implementing this trait. Main

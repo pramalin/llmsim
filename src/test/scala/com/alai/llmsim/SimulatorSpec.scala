@@ -561,23 +561,23 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
 
   "streaming fault injection: delays" - {
 
-    "StreamFault rejects a negative delayBeforeFirstChunk at construction" in {
+    "StreamFault rejects a negative delayBeforeFirstEvent at construction" in {
       assertThrows[IllegalArgumentException] {
-        StreamFault(delayBeforeFirstChunk = Some(-1.second))
+        StreamFault(delayBeforeFirstEvent = -1.second)
       }
     }
 
-    "StreamFault rejects a negative delayBetweenChunks at construction" in {
+    "StreamFault rejects a negative delayBetweenEvents at construction" in {
       assertThrows[IllegalArgumentException] {
-        StreamFault(delayBetweenChunks = Some(-1.second))
+        StreamFault(delayBetweenEvents = -1.second)
       }
     }
 
-    "delayBeforeFirstChunk delays the first byte of the response, measurably" in {
+    "delayBeforeFirstEvent delays the first byte of the response, measurably" in {
       val delay = 300.millis
       for {
         c        <- clientFor(Script.exactly(
-                      reply("hi", streamFault = streamFault(delayBeforeFirstChunk = Some(delay)))
+                      reply("hi", streamFault = streamFault(delayBeforeFirstEvent = delay))
                     ))
         before   <- Clock[IO].monotonic
         _        <- c.expect[String](openAIStreamingRequest())
@@ -599,7 +599,7 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
       } yield (after - before) should be < 1.second
     }
 
-    "delayBetweenChunks adds a gap before every frame after the first, cumulatively" in {
+    "delayBetweenEvents adds a gap before every frame after the first, cumulatively" in {
       // "hello there world" -> 3 word chunks + role chunk + final chunk +
       // [DONE] = 6 frames total, 5 gaps after the first. A 3-word Reply
       // is used specifically so this has enough frames for "cumulative"
@@ -607,7 +607,7 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
       val gap = 100.millis
       for {
         c        <- clientFor(Script.exactly(
-                      reply("hello there world", streamFault = streamFault(delayBetweenChunks = Some(gap)))
+                      reply("hello there world", streamFault = streamFault(delayBetweenEvents = gap))
                     ))
         before   <- Clock[IO].monotonic
         response <- c.expect[String](openAIStreamingRequest())
@@ -619,28 +619,20 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
     }
 
     "a script's headers are set on the response regardless of a streamFault delay" in {
-      // Deliberately NOT asserting anything about elapsed time here
-      // anymore. Two rounds of trying to time this via
-      // Resource.use(...).use(f) both showed the delay being fully
-      // experienced (up to the injected 1s) even though f only reads
-      // r.headers, never the body -- meaning Resource release (which
-      // .use doesn't return past until it completes) appears to wait on
-      // the still-pending frames stream rather than promptly
-      // interrupting it. That's either a property of how Client.
-      // fromHttpApp releases a Response resource in tests, or a real
-      // question about whether a pending Stream.sleep inside a response
-      // body actually gets cancelled when the underlying connection
-      // closes early -- directly relevant to mid-stream disconnect
-      // (the next fault-injection stage) and worth deliberately
-      // investigating THERE, with a real disconnect rather than an
-      // unread body, rather than guessing at it via this test's timing.
-      // What's still safely testable without depending on that answer:
-      // the header VALUE itself is correct.
+      // Client.fromHttpApp finalizes the response resource after `use`.
+      // With a delayed body stream, that finalization affects total
+      // elapsed time even when the callback reads only the headers --
+      // this test therefore verifies header propagation, not
+      // network-level header arrival timing, and deliberately makes no
+      // claim about whether a real server promptly cancels a pending
+      // delay on an early disconnect. That's a separate question,
+      // belonging to its own real-disconnect test in the next
+      // fault-injection stage, not something to infer from this one.
       val delay = 50.millis
       for {
         c    <- clientFor(Script.exactly(
                   reply("hi", headers = Map("x-ratelimit-remaining-requests" -> "59"),
-                    streamFault = streamFault(delayBeforeFirstChunk = Some(delay)))
+                    streamFault = streamFault(delayBeforeFirstEvent = delay))
                 ))
         resp <- c.run(openAIStreamingRequest()).use(r => IO.pure(r.headers))
       } yield resp.get(org.typelevel.ci.CIString("x-ratelimit-remaining-requests")).map(_.head.value) shouldBe Some("59")
@@ -651,7 +643,7 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
       for {
         c        <- clientFor(Script.exactly(
                       toolCall(id = "call-1", name = "get_weather", arguments = """{"city":"SF"}""",
-                        streamFault = streamFault(delayBeforeFirstChunk = Some(delay)))
+                        streamFault = streamFault(delayBeforeFirstEvent = delay))
                     ))
         response <- c.expect[String](openAIStreamingRequest("what's the weather?"))
       } yield {
@@ -669,7 +661,7 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
       val delay = 300.millis
       for {
         c      <- clientFor(Script.exactly(
-                    reply("hi", streamFault = streamFault(delayBeforeFirstChunk = Some(delay)))
+                    reply("hi", streamFault = streamFault(delayBeforeFirstEvent = delay))
                   ))
         before <- Clock[IO].monotonic
         _      <- c.expect[String](anthropicStreamingRequest())

@@ -13,7 +13,7 @@ import io.circe.syntax._
 import java.time.Instant
 import java.util.UUID
 import org.typelevel.ci.CIString
-import scala.concurrent.duration.FiniteDuration
+import scala.concurrent.duration.{Duration, FiniteDuration}
 
 /** The simulator itself. Two routes, each mirroring the shape of a real
   * vendor endpoint closely enough that a client library pointed at
@@ -783,14 +783,17 @@ object Simulator {
   // Turns a list of already-rendered SSE frames (post-sseFrame, so
   // including OpenAI's literal "data: [DONE]\n\n" where it applies) into
   // a Stream, inserting artificial delays per a script's StreamFault --
-  // delayBeforeFirstChunk before the first frame, delayBetweenChunks
-  // before every frame after that (including the terminal one). Plain
-  // Stream.emits(frames), unchanged timing, when fault is None or
-  // specifies no delays -- the non-faulted path this project has
-  // relied on since SSE first shipped is untouched.
+  // delayBeforeFirstEvent before the first frame, delayBetweenEvents
+  // before every frame after that (including the terminal one). A
+  // zero duration (StreamFault's default) is filtered out here rather
+  // than turned into a Stream.sleep(Duration.Zero) -- same observable
+  // result, but skips spurious IO scheduling overhead on the common
+  // no-delay path. Plain Stream.emits(frames) when fault is None or
+  // specifies no delays at all -- the non-faulted path this project
+  // has relied on since SSE first shipped is untouched.
   private def paced(frames: List[String], fault: Option[StreamFault]): Stream[IO, String] = {
-    val beforeFirst = fault.flatMap(_.delayBeforeFirstChunk)
-    val between     = fault.flatMap(_.delayBetweenChunks)
+    val beforeFirst = fault.map(_.delayBeforeFirstEvent).filter(_ > Duration.Zero)
+    val between     = fault.map(_.delayBetweenEvents).filter(_ > Duration.Zero)
     frames.zipWithIndex.foldLeft(Stream.empty: Stream[IO, String]) { case (acc, (frame, i)) =>
       val delay = if (i == 0) beforeFirst else between
       val delayed = delay.map(d => Stream.sleep[IO](d)).getOrElse(Stream.empty: Stream[IO, Unit])
