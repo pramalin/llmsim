@@ -191,7 +191,7 @@ object Simulator {
                           handle  <- beginTimed("openai", model, messages, json, receivedAt)
                           outcome <- runner.next
                           result  <- outcome match {
-                                       case NextStep.Answer(Step.Reply(text, usageOverride, headers), idx) if body.stream.contains(true) =>
+                                       case NextStep.Answer(Step.Reply(text, usageOverride, headers, streamFault), idx) if body.stream.contains(true) =>
                                          val chatId  = s"chatcmpl-sim-${UUID.randomUUID()}"
                                          val created = Instant.now().getEpochSecond
                                          def chunk(delta: OpenAI.Delta, finish: Option[String]): Json =
@@ -202,8 +202,9 @@ object Simulator {
                                          val contentChunks = wordChunks(text).map(piece => chunk(OpenAI.Delta(content = Some(piece)), None))
                                          val finalChunk    = chunk(OpenAI.Delta(), Some("stop"))
 
-                                         val frames = Stream.emits(roleChunk :: contentChunks ::: List(finalChunk))
-                                           .map(j => sseFrame(None, j)) ++ Stream.emit("data: [DONE]\n\n")
+                                         val renderedFrames = (roleChunk :: contentChunks ::: List(finalChunk))
+                                           .map(j => sseFrame(None, j)) :+ "data: [DONE]\n\n"
+                                         val frames = paced(renderedFrames, streamFault)
 
                                          // Same aggregate response shape a non-streaming call would have
                                          // logged -- only `streamed` distinguishes transport in the journal.
@@ -218,7 +219,7 @@ object Simulator {
                                            headers
                                          )
 
-                                       case NextStep.Answer(Step.Reply(text, usageOverride, headers), idx) =>
+                                       case NextStep.Answer(Step.Reply(text, usageOverride, headers, _), idx) =>
                                          val response = OpenAI.ChatResponse(
                                            id = s"chatcmpl-sim-${UUID.randomUUID()}",
                                            created = Instant.now().getEpochSecond,
@@ -239,7 +240,7 @@ object Simulator {
                                            result <- withHeaders(Ok(responseJson), headers)
                                          } yield result
 
-                                       case NextStep.Answer(Step.ToolCall(id, name, arguments, usageOverride, headers), idx) if body.stream.contains(true) =>
+                                       case NextStep.Answer(Step.ToolCall(id, name, arguments, usageOverride, headers, streamFault), idx) if body.stream.contains(true) =>
                                          val chatId  = s"chatcmpl-sim-${UUID.randomUUID()}"
                                          val created = Instant.now().getEpochSecond
                                          def chunk(delta: OpenAI.Delta, finish: Option[String]): Json =
@@ -254,8 +255,9 @@ object Simulator {
                                            ))), None)
                                          val finalChunk = chunk(OpenAI.Delta(), Some("tool_calls"))
 
-                                         val frames = Stream.emits(List(roleChunk, toolChunk, finalChunk))
-                                           .map(j => sseFrame(None, j)) ++ Stream.emit("data: [DONE]\n\n")
+                                         val renderedFrames = List(roleChunk, toolChunk, finalChunk)
+                                           .map(j => sseFrame(None, j)) :+ "data: [DONE]\n\n"
+                                         val frames = paced(renderedFrames, streamFault)
 
                                          val aggregate = OpenAI.ChatResponse(
                                            id = chatId, created = created, model = body.model,
@@ -271,7 +273,7 @@ object Simulator {
                                            headers
                                          )
 
-                                       case NextStep.Answer(Step.ToolCall(id, name, arguments, usageOverride, headers), idx) =>
+                                       case NextStep.Answer(Step.ToolCall(id, name, arguments, usageOverride, headers, _), idx) =>
                                          val response = OpenAI.ChatResponse(
                                            id = s"chatcmpl-sim-${UUID.randomUUID()}",
                                            created = Instant.now().getEpochSecond,
@@ -298,7 +300,7 @@ object Simulator {
                                            result <- withHeaders(Ok(responseJson), headers)
                                          } yield result
 
-                                       case NextStep.Answer(Step.ReplyFromToolResult(toolCallId, render, usageOverride, headers), idx) =>
+                                       case NextStep.Answer(Step.ReplyFromToolResult(toolCallId, render, usageOverride, headers, streamFault), idx) =>
                                          findOpenAIToolResult(body, toolCallId) match {
                                            case None =>
                                              val message = s"llmsim: this script step expected a tool_result for " +
@@ -322,8 +324,9 @@ object Simulator {
                                              val contentChunks = wordChunks(text).map(piece => chunk(OpenAI.Delta(content = Some(piece)), None))
                                              val finalChunk    = chunk(OpenAI.Delta(), Some("stop"))
 
-                                             val frames = Stream.emits(roleChunk :: contentChunks ::: List(finalChunk))
-                                               .map(j => sseFrame(None, j)) ++ Stream.emit("data: [DONE]\n\n")
+                                             val renderedFrames = (roleChunk :: contentChunks ::: List(finalChunk))
+                                               .map(j => sseFrame(None, j)) :+ "data: [DONE]\n\n"
+                                             val frames = paced(renderedFrames, streamFault)
 
                                              val aggregate = OpenAI.ChatResponse(
                                                id = chatId, created = created, model = body.model,
@@ -398,7 +401,7 @@ object Simulator {
                           handle  <- beginTimed("anthropic", model, messages, json, receivedAt)
                           outcome <- runner.next
                           result  <- outcome match {
-                                       case NextStep.Answer(Step.Reply(text, usageOverride, headers), idx) if body.stream.contains(true) =>
+                                       case NextStep.Answer(Step.Reply(text, usageOverride, headers, streamFault), idx) if body.stream.contains(true) =>
                                          val msgId = s"msg-sim-${UUID.randomUUID()}"
                                          val usage = anthropicUsage(anthropicPromptText(body), text, usageOverride)
 
@@ -425,7 +428,8 @@ object Simulator {
                                              textDeltas.map(d => ("content_block_delta", d)) :::
                                              List(("content_block_stop", blockStop), ("message_delta", messageDelta), ("message_stop", messageStop))
 
-                                         val frames = Stream.emits(events).map { case (ev, j) => sseFrame(Some(ev), j) }
+                                         val renderedFrames = events.map { case (ev, j) => sseFrame(Some(ev), j) }
+                                         val frames = paced(renderedFrames, streamFault)
 
                                          val aggregate = Anthropic.MessagesResponse(
                                            id = msgId, content = List(Anthropic.ContentBlock(`type` = "text", text = Some(text))),
@@ -437,7 +441,7 @@ object Simulator {
                                            headers
                                          )
 
-                                       case NextStep.Answer(Step.Reply(text, usageOverride, headers), idx) =>
+                                       case NextStep.Answer(Step.Reply(text, usageOverride, headers, _), idx) =>
                                          val response = Anthropic.MessagesResponse(
                                            id = s"msg-sim-${UUID.randomUUID()}",
                                            content = List(Anthropic.ContentBlock(`type` = "text", text = Some(text))),
@@ -452,7 +456,7 @@ object Simulator {
                                            result <- withHeaders(Ok(responseJson), headers)
                                          } yield result
 
-                                       case NextStep.Answer(Step.ToolCall(id, name, arguments, usageOverride, headers), idx) =>
+                                       case NextStep.Answer(Step.ToolCall(id, name, arguments, usageOverride, headers, streamFault), idx) =>
                                          parseJson(arguments) match {
                                            case Left(parseError) =>
                                              val message =
@@ -497,7 +501,8 @@ object Simulator {
                                                ("content_block_delta", inputDelta), ("content_block_stop", blockStop),
                                                ("message_delta", messageDelta), ("message_stop", messageStop)
                                              )
-                                             val frames = Stream.emits(events).map { case (ev, j) => sseFrame(Some(ev), j) }
+                                             val renderedFrames = events.map { case (ev, j) => sseFrame(Some(ev), j) }
+                                             val frames = paced(renderedFrames, streamFault)
 
                                              val aggregate = Anthropic.MessagesResponse(
                                                id = msgId,
@@ -528,7 +533,7 @@ object Simulator {
                                              } yield result
                                          }
 
-                                       case NextStep.Answer(Step.ReplyFromToolResult(toolCallId, render, usageOverride, headers), idx) =>
+                                       case NextStep.Answer(Step.ReplyFromToolResult(toolCallId, render, usageOverride, headers, streamFault), idx) =>
                                          findAnthropicToolResult(body, toolCallId) match {
                                            case None =>
                                              val message = s"llmsim: this script step expected a tool_result for " +
@@ -568,7 +573,8 @@ object Simulator {
                                                  textDeltas.map(d => ("content_block_delta", d)) :::
                                                  List(("content_block_stop", blockStop), ("message_delta", messageDelta), ("message_stop", messageStop))
 
-                                             val frames = Stream.emits(events).map { case (ev, j) => sseFrame(Some(ev), j) }
+                                             val renderedFrames = events.map { case (ev, j) => sseFrame(Some(ev), j) }
+                                             val frames = paced(renderedFrames, streamFault)
 
                                              val aggregate = Anthropic.MessagesResponse(
                                                id = msgId, content = List(Anthropic.ContentBlock(`type` = "text", text = Some(text))),
@@ -773,6 +779,24 @@ object Simulator {
   // included.
   private def wordChunks(text: String): List[String] =
     text.split(" ", -1).toList.zipWithIndex.map { case (w, i) => if (i == 0) w else s" $w" }
+
+  // Turns a list of already-rendered SSE frames (post-sseFrame, so
+  // including OpenAI's literal "data: [DONE]\n\n" where it applies) into
+  // a Stream, inserting artificial delays per a script's StreamFault --
+  // delayBeforeFirstChunk before the first frame, delayBetweenChunks
+  // before every frame after that (including the terminal one). Plain
+  // Stream.emits(frames), unchanged timing, when fault is None or
+  // specifies no delays -- the non-faulted path this project has
+  // relied on since SSE first shipped is untouched.
+  private def paced(frames: List[String], fault: Option[StreamFault]): Stream[IO, String] = {
+    val beforeFirst = fault.flatMap(_.delayBeforeFirstChunk)
+    val between     = fault.flatMap(_.delayBetweenChunks)
+    frames.zipWithIndex.foldLeft(Stream.empty: Stream[IO, String]) { case (acc, (frame, i)) =>
+      val delay = if (i == 0) beforeFirst else between
+      val delayed = delay.map(d => Stream.sleep[IO](d)).getOrElse(Stream.empty: Stream[IO, Unit])
+      acc ++ delayed.drain ++ Stream.emit(frame)
+    }
+  }
 
   // A script-provided UsageOverride is used verbatim when present -- for
   // testing behavior at a specific token count precisely (a budget check,

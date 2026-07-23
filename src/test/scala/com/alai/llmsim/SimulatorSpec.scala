@@ -1,6 +1,6 @@
 package com.alai.llmsim
 
-import cats.effect.IO
+import cats.effect.{Clock, IO}
 import cats.effect.testing.scalatest.AsyncIOSpec
 import cats.syntax.parallel._
 import org.http4s._
@@ -12,6 +12,7 @@ import org.scalatest.matchers.should.Matchers
 import io.circe.{Decoder, Json}
 import io.circe.generic.semiauto.deriveDecoder
 import io.circe.parser.{parse => parseJson}
+import scala.concurrent.duration._
 
 import Script._
 
@@ -557,6 +558,125 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
   // separately, in ci/spring-verification -- these are the authoritative
   // tests for what llmsim actually puts on the wire.
   // ---------------------------------------------------------------------
+
+  "streaming fault injection: delays" - {
+
+    "StreamFault rejects a negative delayBeforeFirstChunk at construction" in {
+      assertThrows[IllegalArgumentException] {
+        StreamFault(delayBeforeFirstChunk = Some(-1.second))
+      }
+    }
+
+    "StreamFault rejects a negative delayBetweenChunks at construction" in {
+      assertThrows[IllegalArgumentException] {
+        StreamFault(delayBetweenChunks = Some(-1.second))
+      }
+    }
+
+    "delayBeforeFirstChunk delays the first byte of the response, measurably" in {
+      val delay = 300.millis
+      for {
+        c        <- clientFor(Script.exactly(
+                      reply("hi", streamFault = streamFault(delayBeforeFirstChunk = Some(delay)))
+                    ))
+        before   <- Clock[IO].monotonic
+        _        <- c.expect[String](openAIStreamingRequest())
+        after    <- Clock[IO].monotonic
+      } yield (after - before) should be >= delay
+    }
+
+    "with no StreamFault, there's no measurable added delay" in {
+      // A generous threshold, deliberately -- this only needs to rule
+      // out a deliberate multi-hundred-millisecond delay being silently
+      // injected, not pin down exact overhead. 300ms flaked here under
+      // ordinary test-suite load (see the headers test above); nothing
+      // about this test's purpose needs a tight bound.
+      for {
+        c      <- clientFor(Script.exactly(reply("hello there world")))
+        before <- Clock[IO].monotonic
+        _      <- c.expect[String](openAIStreamingRequest())
+        after  <- Clock[IO].monotonic
+      } yield (after - before) should be < 1.second
+    }
+
+    "delayBetweenChunks adds a gap before every frame after the first, cumulatively" in {
+      // "hello there world" -> 3 word chunks + role chunk + final chunk +
+      // [DONE] = 6 frames total, 5 gaps after the first. A 3-word Reply
+      // is used specifically so this has enough frames for "cumulative"
+      // to actually mean something, not just one single delay.
+      val gap = 100.millis
+      for {
+        c        <- clientFor(Script.exactly(
+                      reply("hello there world", streamFault = streamFault(delayBetweenChunks = Some(gap)))
+                    ))
+        before   <- Clock[IO].monotonic
+        response <- c.expect[String](openAIStreamingRequest())
+        after    <- Clock[IO].monotonic
+      } yield {
+        parseFrames(response).size shouldBe 6
+        (after - before) should be >= (gap * 5)
+      }
+    }
+
+    "a script's headers are set on the response regardless of a streamFault delay" in {
+      // Deliberately NOT asserting anything about elapsed time here
+      // anymore. Two rounds of trying to time this via
+      // Resource.use(...).use(f) both showed the delay being fully
+      // experienced (up to the injected 1s) even though f only reads
+      // r.headers, never the body -- meaning Resource release (which
+      // .use doesn't return past until it completes) appears to wait on
+      // the still-pending frames stream rather than promptly
+      // interrupting it. That's either a property of how Client.
+      // fromHttpApp releases a Response resource in tests, or a real
+      // question about whether a pending Stream.sleep inside a response
+      // body actually gets cancelled when the underlying connection
+      // closes early -- directly relevant to mid-stream disconnect
+      // (the next fault-injection stage) and worth deliberately
+      // investigating THERE, with a real disconnect rather than an
+      // unread body, rather than guessing at it via this test's timing.
+      // What's still safely testable without depending on that answer:
+      // the header VALUE itself is correct.
+      val delay = 50.millis
+      for {
+        c    <- clientFor(Script.exactly(
+                  reply("hi", headers = Map("x-ratelimit-remaining-requests" -> "59"),
+                    streamFault = streamFault(delayBeforeFirstChunk = Some(delay)))
+                ))
+        resp <- c.run(openAIStreamingRequest()).use(r => IO.pure(r.headers))
+      } yield resp.get(org.typelevel.ci.CIString("x-ratelimit-remaining-requests")).map(_.head.value) shouldBe Some("59")
+    }
+
+    "streamed tool call arguments still round-trip correctly under a delay" in {
+      val delay = 100.millis
+      for {
+        c        <- clientFor(Script.exactly(
+                      toolCall(id = "call-1", name = "get_weather", arguments = """{"city":"SF"}""",
+                        streamFault = streamFault(delayBeforeFirstChunk = Some(delay)))
+                    ))
+        response <- c.expect[String](openAIStreamingRequest("what's the weather?"))
+      } yield {
+        val frames = parseFrames(response)
+        val toolCallChunk = frames.init.map(_._2).flatMap(parseJson(_).toOption).find { j =>
+          j.hcursor.downField("choices").downArray.downField("delta").downField("tool_calls").downArray.succeeded
+        }.get
+        val fn = toolCallChunk.hcursor.downField("choices").downArray.downField("delta")
+          .downField("tool_calls").downArray.downField("function")
+        fn.downField("name").as[String] shouldBe Right("get_weather")
+      }
+    }
+
+    "delays apply the same way against the Anthropic-shaped endpoint" in {
+      val delay = 300.millis
+      for {
+        c      <- clientFor(Script.exactly(
+                    reply("hi", streamFault = streamFault(delayBeforeFirstChunk = Some(delay)))
+                  ))
+        before <- Clock[IO].monotonic
+        _      <- c.expect[String](anthropicStreamingRequest())
+        after  <- Clock[IO].monotonic
+      } yield (after - before) should be >= delay
+    }
+  }
 
   "OpenAI SSE streaming" - {
 

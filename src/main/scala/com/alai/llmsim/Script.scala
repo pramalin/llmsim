@@ -1,5 +1,7 @@
 package com.alai.llmsim
 
+import scala.concurrent.duration.{Duration, FiniteDuration}
+
 /** An explicit token count a script pins to a step, instead of relying on
   * llmsim's word-count heuristic. `promptTokens`/`completionTokens` map
   * directly onto both wire shapes: OpenAI's `usage.prompt_tokens` /
@@ -12,6 +14,33 @@ package com.alai.llmsim
 final case class UsageOverride(promptTokens: Int, completionTokens: Int) {
   require(promptTokens >= 0, s"promptTokens must be >= 0, got $promptTokens")
   require(completionTokens >= 0, s"completionTokens must be >= 0, got $completionTokens")
+}
+
+/** Artificial timing a script can attach to a streamed response --
+  * ignored entirely for a non-streaming call to the same step, since
+  * these are transport-level effects with nothing meaningful to mean
+  * outside SSE.
+  *
+  * Only delays for now (roadmap item 14's first stage); disconnect,
+  * malformed events, an omitted completion event, and split tool-call
+  * arguments are the same StreamFault case class's later fields, not a
+  * new type -- adding fields here as each one lands keeps every
+  * existing script (which never mentions StreamFault at all) compiling
+  * unchanged throughout.
+  */
+final case class StreamFault(
+    // Silence before the FIRST frame goes out at all (including the
+    // role-announcing delta) -- a stand-in for real "time to first
+    // token" latency.
+    delayBeforeFirstChunk: Option[FiniteDuration] = None,
+    // Silence before every frame AFTER the first, applied uniformly --
+    // including before the terminal frame (OpenAI's literal [DONE], or
+    // Anthropic's message_stop) -- a stand-in for a model that's slow
+    // to keep generating, not just slow to start.
+    delayBetweenChunks: Option[FiniteDuration] = None
+) {
+  delayBeforeFirstChunk.foreach(d => require(d >= Duration.Zero, s"delayBeforeFirstChunk must be >= 0, got $d"))
+  delayBetweenChunks.foreach(d => require(d >= Duration.Zero, s"delayBetweenChunks must be >= 0, got $d"))
 }
 
 /** A single call gets answered by one Step.
@@ -28,7 +57,12 @@ final case class UsageOverride(promptTokens: Int, completionTokens: Int) {
   */
 sealed trait Step
 object Step {
-  final case class Reply(text: String, usage: Option[UsageOverride] = None, headers: Map[String, String] = Map.empty) extends Step
+  final case class Reply(
+      text: String,
+      usage: Option[UsageOverride] = None,
+      headers: Map[String, String] = Map.empty,
+      streamFault: Option[StreamFault] = None
+  ) extends Step
   final case class Error(status: Int, message: String, headers: Map[String, String] = Map.empty) extends Step
 
   /** The model requests a tool instead of replying with text. `arguments`
@@ -36,7 +70,14 @@ object Step {
     * JSON-encoded string there) -- see Protocol.scala for why, and for
     * the Anthropic-side asymmetry this creates.
     */
-  final case class ToolCall(id: String, name: String, arguments: String, usage: Option[UsageOverride] = None, headers: Map[String, String] = Map.empty) extends Step
+  final case class ToolCall(
+      id: String,
+      name: String,
+      arguments: String,
+      usage: Option[UsageOverride] = None,
+      headers: Map[String, String] = Map.empty,
+      streamFault: Option[StreamFault] = None
+  ) extends Step
 
   /** Builds its reply from the REAL tool result the app sends back in its
     * follow-up request, instead of a fixed string. llmsim never calls any
@@ -46,7 +87,13 @@ object Step {
     * If no tool_result matching `toolCallId` is found, this fails loudly
     * rather than silently falling back to something misleading.
     */
-  final case class ReplyFromToolResult(toolCallId: String, render: String => String, usage: Option[UsageOverride] = None, headers: Map[String, String] = Map.empty) extends Step
+  final case class ReplyFromToolResult(
+      toolCallId: String,
+      render: String => String,
+      usage: Option[UsageOverride] = None,
+      headers: Map[String, String] = Map.empty,
+      streamFault: Option[StreamFault] = None
+  ) extends Step
 }
 
 /** What happens on the call AFTER the script's last step. There is no
@@ -71,19 +118,47 @@ object Script {
   def repeatingLast(steps: Step*): Script = Script(steps.toList, Overrun.RepeatLast)
   def cycling(steps: Step*): Script       = Script(steps.toList, Overrun.Cycle)
 
-  def reply(text: String, usage: Option[UsageOverride] = None, headers: Map[String, String] = Map.empty): Step =
-    Step.Reply(text, usage, headers)
+  def reply(
+      text: String,
+      usage: Option[UsageOverride] = None,
+      headers: Map[String, String] = Map.empty,
+      streamFault: Option[StreamFault] = None
+  ): Step =
+    Step.Reply(text, usage, headers, streamFault)
   def error(status: Int, message: String, headers: Map[String, String] = Map.empty): Step =
     Step.Error(status, message, headers)
-  def toolCall(id: String, name: String, arguments: String, usage: Option[UsageOverride] = None, headers: Map[String, String] = Map.empty): Step =
-    Step.ToolCall(id, name, arguments, usage, headers)
-  def replyFromToolResult(toolCallId: String, usage: Option[UsageOverride] = None, headers: Map[String, String] = Map.empty)(render: String => String): Step =
-    Step.ReplyFromToolResult(toolCallId, render, usage, headers)
+  def toolCall(
+      id: String,
+      name: String,
+      arguments: String,
+      usage: Option[UsageOverride] = None,
+      headers: Map[String, String] = Map.empty,
+      streamFault: Option[StreamFault] = None
+  ): Step =
+    Step.ToolCall(id, name, arguments, usage, headers, streamFault)
+  def replyFromToolResult(
+      toolCallId: String,
+      usage: Option[UsageOverride] = None,
+      headers: Map[String, String] = Map.empty,
+      streamFault: Option[StreamFault] = None
+  )(render: String => String): Step =
+    Step.ReplyFromToolResult(toolCallId, render, usage, headers, streamFault)
 
   // So a script reads `reply("hi", usage = usage(promptTokens = 10, completionTokens = 20))`
   // instead of `Some(UsageOverride(10, 20))`.
   def usage(promptTokens: Int, completionTokens: Int): Option[UsageOverride] =
     Some(UsageOverride(promptTokens, completionTokens))
+
+  // Same convenience pattern as usage(...) above: `reply("hi", streamFault =
+  // streamFault(delayBeforeFirstChunk = Some(2.seconds)))` instead of
+  // spelling out Some(StreamFault(...)) by hand. Only ever has an
+  // observable effect on a streamed call to the same step -- see
+  // StreamFault's own doc comment.
+  def streamFault(
+      delayBeforeFirstChunk: Option[FiniteDuration] = None,
+      delayBetweenChunks: Option[FiniteDuration] = None
+  ): Option[StreamFault] =
+    Some(StreamFault(delayBeforeFirstChunk, delayBetweenChunks))
 }
 
 /** Every startup script is a Scala object implementing this trait. Main
