@@ -1,6 +1,7 @@
 package com.alai.llmsim
 
 import cats.effect.{Clock, IO}
+import cats.effect.kernel.Resource
 import cats.syntax.all._
 import fs2.Stream
 import org.http4s._
@@ -41,41 +42,47 @@ object Simulator {
 
   def routes(runner: ScriptRunner, journal: CallJournal): HttpRoutes[IO] = {
 
-    // Captures received/completed as real (wall-clock) time -- for
-    // timeline timestamps -- and duration from monotonic time, per Cats
-    // Effect's own distinction between the two: real time can jump
-    // (NTP adjustment, clock skew) and is wrong for measuring elapsed
+    // receivedAt/startedAt: real (wall-clock) time for timeline
+    // timestamps, monotonic time for duration, per Cats Effect's own
+    // distinction between the two -- real time can jump (NTP
+    // adjustment, clock skew) and is wrong for measuring elapsed
     // duration, monotonic time can't be turned into a meaningful Unix
-    // timestamp. `receivedAt`/`startedAt` are captured once, at the very
-    // top of each route's for-comprehension -- before request-body
-    // decoding even happens -- so `receivedAtEpochMillis` reflects when
-    // the call actually arrived, not when it happened to finish being
-    // processed (which is what the previous single-timestamp version
-    // effectively recorded, since it stamped time inside `record` itself,
-    // after the response was already built).
+    // timestamp. Both are captured once, at the very top of each
+    // route's for-comprehension, before request-body decoding even
+    // happens.
     //
-    // For a STREAMED call specifically: this records BEFORE sseResponse
-    // is returned, not after the SSE body has actually been consumed by
-    // the client -- http4s/fs2 stream the body lazily, on the client's
-    // own read schedule, well after this function returns. So for a
-    // streamed call, completedAtEpochMillis/durationMillis currently mean
-    // "how long it took llmsim to build the response," not "how long the
-    // stream took to fully deliver," and the script step is already
-    // consumed even if the client disconnects before reading a single
-    // frame. This is invisible today only because every chunk is emitted
-    // immediately with no artificial delay; it stops being invisible the
-    // moment fault injection (roadmap item 14) adds delayed chunks,
-    // disconnects, or mid-stream failures -- which is also where a
-    // proper begin/complete/fail/cancel journal lifecycle belongs, not
-    // before there's an actual in-flight state worth representing.
-    def recordTimed(
+    // beginTimed/completeTimed replace what used to be a single
+    // recordTimed call. journal.begin reserves a sequence number and
+    // records arrival as soon as decode outcome is known (success or
+    // failure) -- BEFORE runner.next or any response-building work
+    // happens -- so sequence numbers reflect true arrival order even
+    // if two concurrent requests finish in a different order than they
+    // arrived. journal.complete records the actual outcome; for every
+    // non-streaming branch that still runs immediately, right where
+    // the old single recordTimed call used to sit. For a STREAMED
+    // response, completeTimed is called from the frames stream's own
+    // onFinalizeCase (see sseResponse's call sites below), so it fires
+    // once the stream is actually done being consumed -- successfully,
+    // with an error, or cancelled by a client disconnect -- not merely
+    // when the response object is constructed. That distinction is
+    // exactly what this split exists for: it was invisible with the
+    // old single-shot design because nothing yet injects a delay long
+    // enough for a client to disconnect mid-stream, but it stops being
+    // theoretical the moment fault injection (roadmap item 14) adds
+    // one.
+    def beginTimed(
         provider: String,
         model: Option[String],
         messages: Vector[CapturedMessage],
         rawRequest: Json,
+        receivedAt: FiniteDuration
+    ): IO[CallHandle] =
+      journal.begin(provider, model, messages, rawRequest, receivedAt.toMillis)
+
+    def completeTimed(
+        handle: CallHandle,
         outcome: CallOutcome,
         stepIndex: Option[Int],
-        receivedAt: FiniteDuration,
         startedAt: FiniteDuration,
         responseHeaders: Map[String, String] = Map.empty,
         streamed: Boolean = false
@@ -83,13 +90,43 @@ object Simulator {
       for {
         finishedAt  <- Clock[IO].monotonic
         completedAt <- Clock[IO].realTime
-        call        <- journal.record(
-                          provider, model, messages, rawRequest, outcome, stepIndex,
-                          receivedAt.toMillis, completedAt.toMillis, (finishedAt - startedAt).toMillis,
+        call        <- journal.complete(
+                          handle, outcome, stepIndex, completedAt.toMillis, (finishedAt - startedAt).toMillis,
                           responseHeaders.map { case (k, v) => CapturedHeader(k, v) }.toVector,
                           streamed
                         )
       } yield call
+
+    // Attaches journal completion to the frames stream's OWN lifecycle
+    // via onFinalizeCase, rather than recording eagerly before the
+    // response is even returned: this fires once the stream is
+    // actually done being consumed, whether it finished normally,
+    // errored, or was cancelled by a client disconnect partway through
+    // -- see the comment on beginTimed/completeTimed above for why
+    // that distinction matters. `Resource.ExitCase.Canceled` is the
+    // client-disconnect case: nothing today can actually trigger it
+    // (every chunk sends immediately, with no delay for a client to
+    // disconnect during), but the wiring is correct and ready for
+    // fault injection to exercise it.
+    def finalizeStream(
+        frames: Stream[IO, String],
+        handle: CallHandle,
+        outcome: CallOutcome,
+        stepIndex: Option[Int],
+        startedAt: FiniteDuration,
+        headers: Map[String, String]
+    ): Stream[IO, String] =
+      frames.onFinalizeCase {
+        case Resource.ExitCase.Succeeded =>
+          completeTimed(handle, outcome, stepIndex, startedAt, headers, streamed = true).void
+        case Resource.ExitCase.Errored(e) =>
+          completeTimed(handle, CallOutcome.Failed(e.getMessage), stepIndex, startedAt, headers, streamed = true).void
+        case Resource.ExitCase.Canceled =>
+          completeTimed(
+            handle, CallOutcome.Cancelled("client disconnected before the stream completed"),
+            stepIndex, startedAt, headers, streamed = true
+          ).void
+      }
 
     def recordFailureAndReject(
         provider: String, json: Json, reason: String, receivedAt: FiniteDuration, startedAt: FiniteDuration
@@ -102,7 +139,8 @@ object Simulator {
         )
       )
       for {
-        _      <- recordTimed(provider, None, Vector.empty, json, CallOutcome.Failed(message), None, receivedAt, startedAt)
+        handle <- beginTimed(provider, None, Vector.empty, json, receivedAt)
+        _      <- completeTimed(handle, CallOutcome.Failed(message), None, startedAt)
         result <- errorResponse(400, errorJson)
       } yield result
     }
@@ -150,6 +188,7 @@ object Simulator {
                       case Right(body) =>
                         val (model, messages) = normalizeOpenAI(body)
                         for {
+                          handle  <- beginTimed("openai", model, messages, json, receivedAt)
                           outcome <- runner.next
                           result  <- outcome match {
                                        case NextStep.Answer(Step.Reply(text, usageOverride, headers), idx) if body.stream.contains(true) =>
@@ -174,11 +213,10 @@ object Simulator {
                                            usage = fakeUsage(openAIPromptText(body), text, usageOverride)
                                          ).asJson
 
-                                         for {
-                                           _        <- recordTimed("openai", model, messages, json,
-                                                          CallOutcome.Responded(200, aggregate), Some(idx), receivedAt, startedAt, headers, streamed = true)
-                                           response <- sseResponse(frames, headers)
-                                         } yield response
+                                         sseResponse(
+                                           finalizeStream(frames, handle, CallOutcome.Responded(200, aggregate), Some(idx), startedAt, headers),
+                                           headers
+                                         )
 
                                        case NextStep.Answer(Step.Reply(text, usageOverride, headers), idx) =>
                                          val response = OpenAI.ChatResponse(
@@ -196,8 +234,8 @@ object Simulator {
                                          )
                                          val responseJson = response.asJson
                                          for {
-                                           _      <- recordTimed("openai", model, messages, json,
-                                                        CallOutcome.Responded(200, responseJson), Some(idx), receivedAt, startedAt, headers)
+                                           _      <- completeTimed(handle,
+                                                        CallOutcome.Responded(200, responseJson), Some(idx), startedAt, headers)
                                            result <- withHeaders(Ok(responseJson), headers)
                                          } yield result
 
@@ -228,11 +266,10 @@ object Simulator {
                                            usage = fakeUsage(openAIPromptText(body), s"$name($arguments)", usageOverride)
                                          ).asJson
 
-                                         for {
-                                           _        <- recordTimed("openai", model, messages, json,
-                                                          CallOutcome.Responded(200, aggregate), Some(idx), receivedAt, startedAt, headers, streamed = true)
-                                           response <- sseResponse(frames, headers)
-                                         } yield response
+                                         sseResponse(
+                                           finalizeStream(frames, handle, CallOutcome.Responded(200, aggregate), Some(idx), startedAt, headers),
+                                           headers
+                                         )
 
                                        case NextStep.Answer(Step.ToolCall(id, name, arguments, usageOverride, headers), idx) =>
                                          val response = OpenAI.ChatResponse(
@@ -256,8 +293,8 @@ object Simulator {
                                          )
                                          val responseJson = response.asJson
                                          for {
-                                           _      <- recordTimed("openai", model, messages, json,
-                                                        CallOutcome.Responded(200, responseJson), Some(idx), receivedAt, startedAt, headers)
+                                           _      <- completeTimed(handle,
+                                                        CallOutcome.Responded(200, responseJson), Some(idx), startedAt, headers)
                                            result <- withHeaders(Ok(responseJson), headers)
                                          } yield result
 
@@ -268,8 +305,8 @@ object Simulator {
                                                s"tool_call_id '$toolCallId', but none was found in the request."
                                              val errorJson = OpenAI.ErrorBody(OpenAI.ErrorDetail(message, "missing_tool_result")).asJson
                                              for {
-                                               _      <- recordTimed("openai", model, messages, json,
-                                                            CallOutcome.Failed(message), Some(idx), receivedAt, startedAt)
+                                               _      <- completeTimed(handle,
+                                                            CallOutcome.Failed(message), Some(idx), startedAt)
                                                result <- errorResponse(500, errorJson)
                                              } yield result
 
@@ -294,11 +331,10 @@ object Simulator {
                                                usage = fakeUsage(openAIPromptText(body), text, usageOverride)
                                              ).asJson
 
-                                             for {
-                                               _        <- recordTimed("openai", model, messages, json,
-                                                              CallOutcome.Responded(200, aggregate), Some(idx), receivedAt, startedAt, headers, streamed = true)
-                                               response <- sseResponse(frames, headers)
-                                             } yield response
+                                             sseResponse(
+                                               finalizeStream(frames, handle, CallOutcome.Responded(200, aggregate), Some(idx), startedAt, headers),
+                                               headers
+                                             )
 
                                            case Some(resultText) =>
                                              val text = render(resultText)
@@ -317,8 +353,8 @@ object Simulator {
                                              )
                                              val responseJson = response.asJson
                                              for {
-                                               _      <- recordTimed("openai", model, messages, json,
-                                                            CallOutcome.Responded(200, responseJson), Some(idx), receivedAt, startedAt, headers)
+                                               _      <- completeTimed(handle,
+                                                            CallOutcome.Responded(200, responseJson), Some(idx), startedAt, headers)
                                                result <- withHeaders(Ok(responseJson), headers)
                                              } yield result
                                          }
@@ -326,8 +362,8 @@ object Simulator {
                                        case NextStep.Answer(Step.Error(status, message, headers), idx) =>
                                          val errorJson = OpenAI.ErrorBody(OpenAI.ErrorDetail(message)).asJson
                                          for {
-                                           _      <- recordTimed("openai", model, messages, json,
-                                                        CallOutcome.Rejected(status, message), Some(idx), receivedAt, startedAt, headers)
+                                           _      <- completeTimed(handle,
+                                                        CallOutcome.Rejected(status, message), Some(idx), startedAt, headers)
                                            result <- errorResponse(status, errorJson, headers)
                                          } yield result
 
@@ -335,8 +371,8 @@ object Simulator {
                                          val message = "llmsim: script exhausted -- simulator received a call beyond the configured script"
                                          val errorJson = OpenAI.ErrorBody(OpenAI.ErrorDetail(message, "script_exhausted")).asJson
                                          for {
-                                           _      <- recordTimed("openai", model, messages, json,
-                                                        CallOutcome.Rejected(500, message), None, receivedAt, startedAt)
+                                           _      <- completeTimed(handle,
+                                                        CallOutcome.Rejected(500, message), None, startedAt)
                                            result <- errorResponse(500, errorJson)
                                          } yield result
                                      }
@@ -359,6 +395,7 @@ object Simulator {
                       case Right(body) =>
                         val (model, messages) = normalizeAnthropic(body)
                         for {
+                          handle  <- beginTimed("anthropic", model, messages, json, receivedAt)
                           outcome <- runner.next
                           result  <- outcome match {
                                        case NextStep.Answer(Step.Reply(text, usageOverride, headers), idx) if body.stream.contains(true) =>
@@ -395,11 +432,10 @@ object Simulator {
                                            model = body.model, stop_reason = "end_turn", usage = usage
                                          ).asJson
 
-                                         for {
-                                           _        <- recordTimed("anthropic", model, messages, json,
-                                                          CallOutcome.Responded(200, aggregate), Some(idx), receivedAt, startedAt, headers, streamed = true)
-                                           response <- sseResponse(frames, headers)
-                                         } yield response
+                                         sseResponse(
+                                           finalizeStream(frames, handle, CallOutcome.Responded(200, aggregate), Some(idx), startedAt, headers),
+                                           headers
+                                         )
 
                                        case NextStep.Answer(Step.Reply(text, usageOverride, headers), idx) =>
                                          val response = Anthropic.MessagesResponse(
@@ -411,8 +447,8 @@ object Simulator {
                                          )
                                          val responseJson = response.asJson
                                          for {
-                                           _      <- recordTimed("anthropic", model, messages, json,
-                                                        CallOutcome.Responded(200, responseJson), Some(idx), receivedAt, startedAt, headers)
+                                           _      <- completeTimed(handle,
+                                                        CallOutcome.Responded(200, responseJson), Some(idx), startedAt, headers)
                                            result <- withHeaders(Ok(responseJson), headers)
                                          } yield result
 
@@ -427,8 +463,8 @@ object Simulator {
                                                  s"against the OpenAI-shaped endpoint. (${parseError.getMessage})"
                                              val errorJson = Anthropic.ErrorBody(error = Anthropic.ErrorDetail("simulator_error", message)).asJson
                                              for {
-                                               _      <- recordTimed("anthropic", model, messages, json,
-                                                            CallOutcome.Failed(message), Some(idx), receivedAt, startedAt)
+                                               _      <- completeTimed(handle,
+                                                            CallOutcome.Failed(message), Some(idx), startedAt)
                                                result <- errorResponse(500, errorJson)
                                              } yield result
 
@@ -469,11 +505,10 @@ object Simulator {
                                                model = body.model, stop_reason = "tool_use", usage = usage
                                              ).asJson
 
-                                             for {
-                                               _        <- recordTimed("anthropic", model, messages, json,
-                                                              CallOutcome.Responded(200, aggregate), Some(idx), receivedAt, startedAt, headers, streamed = true)
-                                               response <- sseResponse(frames, headers)
-                                             } yield response
+                                             sseResponse(
+                                               finalizeStream(frames, handle, CallOutcome.Responded(200, aggregate), Some(idx), startedAt, headers),
+                                               headers
+                                             )
 
                                            case Right(inputJson) =>
                                              val response = Anthropic.MessagesResponse(
@@ -487,8 +522,8 @@ object Simulator {
                                              )
                                              val responseJson = response.asJson
                                              for {
-                                               _      <- recordTimed("anthropic", model, messages, json,
-                                                            CallOutcome.Responded(200, responseJson), Some(idx), receivedAt, startedAt, headers)
+                                               _      <- completeTimed(handle,
+                                                            CallOutcome.Responded(200, responseJson), Some(idx), startedAt, headers)
                                                result <- withHeaders(Ok(responseJson), headers)
                                              } yield result
                                          }
@@ -500,8 +535,8 @@ object Simulator {
                                                s"tool_use_id '$toolCallId', but none was found in the request."
                                              val errorJson = Anthropic.ErrorBody(error = Anthropic.ErrorDetail("missing_tool_result", message)).asJson
                                              for {
-                                               _      <- recordTimed("anthropic", model, messages, json,
-                                                            CallOutcome.Failed(message), Some(idx), receivedAt, startedAt)
+                                               _      <- completeTimed(handle,
+                                                            CallOutcome.Failed(message), Some(idx), startedAt)
                                                result <- errorResponse(500, errorJson)
                                              } yield result
 
@@ -540,11 +575,10 @@ object Simulator {
                                                model = body.model, stop_reason = "end_turn", usage = usage
                                              ).asJson
 
-                                             for {
-                                               _        <- recordTimed("anthropic", model, messages, json,
-                                                              CallOutcome.Responded(200, aggregate), Some(idx), receivedAt, startedAt, headers, streamed = true)
-                                               response <- sseResponse(frames, headers)
-                                             } yield response
+                                             sseResponse(
+                                               finalizeStream(frames, handle, CallOutcome.Responded(200, aggregate), Some(idx), startedAt, headers),
+                                               headers
+                                             )
 
                                            case Some(resultText) =>
                                              val text = render(resultText)
@@ -557,8 +591,8 @@ object Simulator {
                                              )
                                              val responseJson = response.asJson
                                              for {
-                                               _      <- recordTimed("anthropic", model, messages, json,
-                                                            CallOutcome.Responded(200, responseJson), Some(idx), receivedAt, startedAt, headers)
+                                               _      <- completeTimed(handle,
+                                                            CallOutcome.Responded(200, responseJson), Some(idx), startedAt, headers)
                                                result <- withHeaders(Ok(responseJson), headers)
                                              } yield result
                                          }
@@ -566,8 +600,8 @@ object Simulator {
                                        case NextStep.Answer(Step.Error(status, message, headers), idx) =>
                                          val errorJson = Anthropic.ErrorBody(error = Anthropic.ErrorDetail("simulated_error", message)).asJson
                                          for {
-                                           _      <- recordTimed("anthropic", model, messages, json,
-                                                        CallOutcome.Rejected(status, message), Some(idx), receivedAt, startedAt, headers)
+                                           _      <- completeTimed(handle,
+                                                        CallOutcome.Rejected(status, message), Some(idx), startedAt, headers)
                                            result <- errorResponse(status, errorJson, headers)
                                          } yield result
 
@@ -575,8 +609,8 @@ object Simulator {
                                          val message = "llmsim: script exhausted -- simulator received a call beyond the configured script"
                                          val errorJson = Anthropic.ErrorBody(error = Anthropic.ErrorDetail("script_exhausted", message)).asJson
                                          for {
-                                           _      <- recordTimed("anthropic", model, messages, json,
-                                                        CallOutcome.Rejected(500, message), None, receivedAt, startedAt)
+                                           _      <- completeTimed(handle,
+                                                        CallOutcome.Rejected(500, message), None, startedAt)
                                            result <- errorResponse(500, errorJson)
                                          } yield result
                                      }

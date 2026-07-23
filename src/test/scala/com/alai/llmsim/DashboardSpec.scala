@@ -46,7 +46,7 @@ class DashboardSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
       val summary = Dashboard.summarize(Nil, journalCapacity = 1000, runningStatus, scriptName = None)
 
       summary.journal shouldBe JournalSummary(retainedCalls = 0, capacity = 1000)
-      summary.calls.byOutcome shouldBe Map("responded" -> 0, "rejected" -> 0, "failed" -> 0)
+      summary.calls.byOutcome shouldBe Map("responded" -> 0, "rejected" -> 0, "failed" -> 0, "cancelled" -> 0)
       summary.calls.byProvider shouldBe Map("openai" -> 0, "anthropic" -> 0)
       summary.calls.streamed shouldBe 0
       summary.latencyMillis shouldBe LatencySummary(sampleCount = 0, average = None, p95 = None, max = None)
@@ -58,16 +58,17 @@ class DashboardSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
         call("openai", CallOutcome.Responded(200, Json.obj()), 10, streamed = true, receivedAt = 100),
         call("openai", CallOutcome.Rejected(429, "rate limited"), 5, receivedAt = 200),
         call("anthropic", CallOutcome.Responded(200, Json.obj()), 20, receivedAt = 300),
-        call("anthropic", CallOutcome.Failed("decode error"), 1, receivedAt = 400)
+        call("anthropic", CallOutcome.Failed("decode error"), 1, receivedAt = 400),
+        call("openai", CallOutcome.Cancelled("client disconnected before the stream completed"), 15, streamed = true, receivedAt = 500)
       )
       val summary = Dashboard.summarize(calls, journalCapacity = 1000, runningStatus, scriptName = None)
 
-      summary.calls.byOutcome shouldBe Map("responded" -> 2, "rejected" -> 1, "failed" -> 1)
-      summary.calls.byProvider shouldBe Map("openai" -> 2, "anthropic" -> 2)
-      summary.calls.streamed shouldBe 1
+      summary.calls.byOutcome shouldBe Map("responded" -> 2, "rejected" -> 1, "failed" -> 1, "cancelled" -> 1)
+      summary.calls.byProvider shouldBe Map("openai" -> 3, "anthropic" -> 2)
+      summary.calls.streamed shouldBe 2
       // Calls are in journal (received) order -- the last element in the
       // input list is the most recently received call.
-      summary.lastCallAtEpochMillis shouldBe Some(400L)
+      summary.lastCallAtEpochMillis shouldBe Some(500L)
     }
 
     "a single call: average, p95, and max all equal its duration" in {

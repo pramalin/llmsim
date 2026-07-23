@@ -74,13 +74,14 @@ object Dashboard {
     case Overrun.Cycle      => "cycle"
   }
 
-  private val KnownOutcomes = List("responded", "rejected", "failed")
+  private val KnownOutcomes = List("responded", "rejected", "failed", "cancelled")
   private val KnownProviders = List("openai", "anthropic")
 
   private def outcomeKey(outcome: CallOutcome): String = outcome match {
     case _: CallOutcome.Responded => "responded"
     case _: CallOutcome.Rejected  => "rejected"
     case _: CallOutcome.Failed    => "failed"
+    case _: CallOutcome.Cancelled => "cancelled"
   }
 
   /** Nearest-rank percentile: the ceil(sampleSize * p)-th smallest value

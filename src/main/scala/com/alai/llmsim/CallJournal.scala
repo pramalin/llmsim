@@ -26,12 +26,19 @@ object CapturedHeader {
   implicit val codec: Codec[CapturedHeader] = deriveCodec
 }
 
-/** What the simulator did with a call. Three cases:
+/** What the simulator did with a call. Four cases:
   *   - Responded: answered normally (a Reply step, or Overrun.RepeatLast/Cycle)
   *   - Rejected: answered with a deliberate error -- either an Error step,
   *     or Overrun.Fail (the script ran out)
   *   - Failed: the request body couldn't even be decoded into the
   *     expected shape; no script step was consumed
+  *   - Cancelled: a streamed call whose connection closed (client
+  *     disconnect) before the stream finished sending. Only reachable
+  *     once fault injection can actually make a stream long-lived
+  *     enough for a disconnect to land mid-flight -- modeled now,
+  *     ahead of that landing, since it's the same CallOutcome sealed
+  *     trait either way and there's no reason to make it a breaking
+  *     change later.
   *
   * Encoded as flat JSON with a "type" discriminator (rather than circe's
   * default nested-object encoding for sealed traits), since the intended
@@ -42,6 +49,7 @@ object CallOutcome {
   final case class Responded(status: Int, body: Json) extends CallOutcome
   final case class Rejected(status: Int, message: String) extends CallOutcome
   final case class Failed(message: String) extends CallOutcome
+  final case class Cancelled(message: String) extends CallOutcome
 
   implicit val encoder: Encoder[CallOutcome] = Encoder.instance {
     case Responded(status, body) =>
@@ -50,6 +58,8 @@ object CallOutcome {
       Json.obj("type" -> Json.fromString("rejected"), "status" -> Json.fromInt(status), "message" -> Json.fromString(message))
     case Failed(message) =>
       Json.obj("type" -> Json.fromString("failed"), "message" -> Json.fromString(message))
+    case Cancelled(message) =>
+      Json.obj("type" -> Json.fromString("cancelled"), "message" -> Json.fromString(message))
   }
 
   implicit val decoder: Decoder[CallOutcome] = Decoder.instance { c =>
@@ -57,6 +67,7 @@ object CallOutcome {
       case "responded" => for { s <- c.get[Int]("status"); b <- c.get[Json]("body") } yield Responded(s, b)
       case "rejected"  => for { s <- c.get[Int]("status"); m <- c.get[String]("message") } yield Rejected(s, m)
       case "failed"    => c.get[String]("message").map(Failed(_))
+      case "cancelled" => c.get[String]("message").map(Cancelled(_))
       case other       => Left(io.circe.DecodingFailure(s"unknown CallOutcome type: $other", c.history))
     }
   }
@@ -83,33 +94,66 @@ final case class CapturedCall(
     completedAtEpochMillis: Long,
     // From a monotonic clock, not (completedAtEpochMillis - receivedAtEpochMillis)
     // -- real/wall-clock time can jump (NTP adjustment, clock skew) and
-    // is the wrong source for measuring elapsed duration. See Simulator's
-    // recordTimed, which is the only caller of `record` and is what
-    // actually captures both clocks.
+    // is the wrong source for measuring elapsed duration.
     durationMillis: Long,
     // Empty for the common case (no script-level headers, or a
     // synthetic llmsim-internal error where the step's own headers
-    // don't apply -- see Simulator.scala's recordTimed call sites for
-    // which branches populate this).
+    // don't apply).
     responseHeaders: Vector[CapturedHeader] = Vector.empty,
     // True if this call was answered as SSE (request had "stream": true
     // and got a text/event-stream response). outcome.body still records
     // the same logical response shape a non-streaming call would have
-    // gotten -- see Simulator.scala's streaming branches -- this flag
-    // is the only thing that tells a reader which transport was
-    // actually used.
+    // gotten -- this flag is the only thing that tells a reader which
+    // transport was actually used.
     streamed: Boolean = false
 )
 
+/** A reservation from `CallJournal.begin`, carrying everything
+  * `complete` needs to build the final record. Plain, immutable data --
+  * no shared mutable state beyond the sequence number itself, which is
+  * reserved atomically at `begin` time.
+  */
+final case class CallHandle(
+    sequence: Long,
+    provider: String,
+    model: Option[String],
+    messages: Vector[CapturedMessage],
+    rawRequest: Json,
+    receivedAtEpochMillis: Long
+)
+
 trait CallJournal {
-  def record(
+  /** Reserves a sequence number and captures arrival, before any
+    * response is built -- called at the very top of a route, same
+    * timing point the old single-shot `record` used for
+    * receivedAtEpochMillis. Sequence numbers are handed out in true
+    * arrival order this way, regardless of which of several concurrent
+    * calls finishes first -- the bug the old completion-time-only
+    * `record` had: two overlapping requests could end up with their
+    * journal order reflecting which one finished first, not which one
+    * actually arrived first.
+    */
+  def begin(
       provider: String,
       model: Option[String],
       messages: Vector[CapturedMessage],
       rawRequest: Json,
+      receivedAtEpochMillis: Long
+  ): IO[CallHandle]
+
+  /** Records the final outcome and makes the call visible in the
+    * journal. For a non-streaming call this runs immediately after
+    * `begin`, in the same route -- there's no long-lived body to wait
+    * on. For a streaming call, this belongs in the SSE frames stream's
+    * own finalizer (see Simulator.scala's `sseResponse`), so it fires
+    * once the stream is actually done being consumed -- successfully,
+    * with an error, or cancelled by a client disconnect -- not merely
+    * when the response object is constructed.
+    */
+  def complete(
+      handle: CallHandle,
       outcome: CallOutcome,
       stepIndex: Option[Int],
-      receivedAtEpochMillis: Long,
       completedAtEpochMillis: Long,
       durationMillis: Long,
       responseHeaders: Vector[CapturedHeader] = Vector.empty,
@@ -129,31 +173,37 @@ trait CallJournal {
 object CallJournal {
   val DefaultMaxEntries = 1000
 
-  /** Sequence and calls live in ONE Ref, not two -- recording both in the
-    * same atomic `modify` is what guarantees sequence order always
-    * matches recording order, even under concurrent requests. Two
-    * separate Refs (as an earlier version had) can't give that guarantee:
-    * a request could grab a sequence number, then lose the race to append
-    * its own call, leaving the journal's array order out of sync with
-    * the sequence numbers it handed out.
+  /** Sequence and calls live in ONE Ref, not two -- `begin` reserving a
+    * sequence and `complete` inserting a call both need to see and
+    * update the same state atomically.
     */
   private final case class JournalState(nextSequence: Long, calls: Vector[CapturedCall])
 
-  /** @param maxEntries oldest entries are dropped once the journal holds
-    *                    more than this many, so a long-running simulator
+  /** @param maxEntries oldest entries (by sequence -- see `complete`
+    *                    below for why that's not simply insertion
+    *                    order) are dropped once the journal holds more
+    *                    than this many, so a long-running simulator
     *                    can't grow its call log without bound.
     */
   def inMemory(maxEntries: Int = DefaultMaxEntries): IO[CallJournal] =
     Ref.of[IO, JournalState](JournalState(nextSequence = 1L, calls = Vector.empty)).map { stateRef =>
       new CallJournal {
-        def record(
+        def begin(
             provider: String,
             model: Option[String],
             messages: Vector[CapturedMessage],
             rawRequest: Json,
+            receivedAtEpochMillis: Long
+        ): IO[CallHandle] =
+          stateRef.modify { state =>
+            val handle = CallHandle(state.nextSequence, provider, model, messages, rawRequest, receivedAtEpochMillis)
+            state.copy(nextSequence = state.nextSequence + 1) -> handle
+          }
+
+        def complete(
+            handle: CallHandle,
             outcome: CallOutcome,
             stepIndex: Option[Int],
-            receivedAtEpochMillis: Long,
             completedAtEpochMillis: Long,
             durationMillis: Long,
             responseHeaders: Vector[CapturedHeader] = Vector.empty,
@@ -161,11 +211,29 @@ object CallJournal {
         ): IO[CapturedCall] =
           stateRef.modify { state =>
             val call = CapturedCall(
-              state.nextSequence, provider, model, messages, rawRequest, outcome, stepIndex,
-              receivedAtEpochMillis, completedAtEpochMillis, durationMillis, responseHeaders, streamed
+              handle.sequence, handle.provider, handle.model, handle.messages, handle.rawRequest,
+              outcome, stepIndex, handle.receivedAtEpochMillis, completedAtEpochMillis, durationMillis,
+              responseHeaders, streamed
             )
-            val retained = (state.calls :+ call).takeRight(maxEntries)
-            JournalState(state.nextSequence + 1, retained) -> call
+            // Sorted by sequence (arrival order), not insertion order:
+            // begin() reserves sequence numbers in true arrival order,
+            // but complete() can run in a DIFFERENT order under
+            // concurrency -- a call that arrived second might finish
+            // first. Sorting here keeps both the exposed /_llmsim/calls
+            // ordering AND which entries eviction drops correct by
+            // arrival time, not by whichever call happened to complete
+            // first.
+            //
+            // Known, deliberately deferred gap: a call still in flight
+            // when /_llmsim/reset or DELETE /_llmsim/calls runs, and
+            // completing afterward, inserts itself into the fresh
+            // post-reset journal under its OLD (now out-of-range)
+            // sequence number. Not something today's code can actually
+            // trigger -- nothing is long-lived enough yet for a call to
+            // still be in flight across a reset -- worth revisiting once
+            // fault injection adds real delays.
+            val retained = (state.calls :+ call).sortBy(_.sequence).takeRight(maxEntries)
+            state.copy(calls = retained) -> call
           }
 
         def all: IO[List[CapturedCall]] = stateRef.get.map(_.calls.toList)

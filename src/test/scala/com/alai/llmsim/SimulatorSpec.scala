@@ -89,6 +89,16 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
       case c    => c.toString
     }
 
+  // Wraps journal.begin + journal.complete for tests that record
+  // directly against a CallJournal (not through a live route) --
+  // begin/complete replaced the old single-shot record, see
+  // CallJournal.scala.
+  private def recordCall(journal: CallJournal, provider: String, stepIndex: Option[Int]): IO[CapturedCall] =
+    for {
+      handle <- journal.begin(provider, None, Vector.empty, Json.obj(), System.currentTimeMillis())
+      call   <- journal.complete(handle, CallOutcome.Responded(200, Json.obj()), stepIndex, System.currentTimeMillis(), 0L)
+    } yield call
+
   "a script's replies are consumed in order, per call" in {
     for {
       c     <- clientFor(Script.exactly(reply("first"), reply("second"), reply("third")))
@@ -251,9 +261,9 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
   "the journal is bounded: oldest entries are dropped once the cap is exceeded" in {
     for {
       journal <- CallJournal.inMemory(maxEntries = 2)
-      _       <- journal.record("openai", None, Vector.empty, Json.obj(), CallOutcome.Responded(200, Json.obj()), Some(0), System.currentTimeMillis(), System.currentTimeMillis(), 0L)
-      _       <- journal.record("openai", None, Vector.empty, Json.obj(), CallOutcome.Responded(200, Json.obj()), Some(1), System.currentTimeMillis(), System.currentTimeMillis(), 0L)
-      _       <- journal.record("openai", None, Vector.empty, Json.obj(), CallOutcome.Responded(200, Json.obj()), Some(2), System.currentTimeMillis(), System.currentTimeMillis(), 0L)
+      _       <- recordCall(journal, "openai", Some(0))
+      _       <- recordCall(journal, "openai", Some(1))
+      _       <- recordCall(journal, "openai", Some(2))
       calls   <- journal.all
     } yield calls.map(_.sequence) shouldBe List(2L, 3L)
   }
@@ -263,14 +273,17 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
     for {
       journal <- CallJournal.inMemory(maxEntries = n)
       _       <- (1 to n).toList.parTraverse { i =>
-                   journal.record("openai", None, Vector.empty, Json.obj(), CallOutcome.Responded(200, Json.obj()), Some(i), System.currentTimeMillis(), System.currentTimeMillis(), 0L)
+                   recordCall(journal, "openai", Some(i))
                  }
       calls   <- journal.all
     } yield {
-      // every sequence number from 1..n present exactly once, and the
-      // array itself is in that same order -- both would fail under the
-      // old two-Ref design if two requests interleaved their two separate
-      // atomic steps (claim a sequence, then append).
+      // Every sequence number from 1..n present exactly once, in that
+      // exact order. begin() and complete() are two separate steps now
+      // (not one atomic record() call), so 200 concurrent recordCall
+      // invocations can genuinely finish complete() in a different
+      // order than they started -- what guarantees this test passes
+      // anyway is CallJournal.complete's sortBy(_.sequence) on every
+      // write, not the absence of interleaving.
       calls.map(_.sequence) shouldBe (1L to n.toLong).toList
     }
   }
