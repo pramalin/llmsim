@@ -110,6 +110,32 @@ object Simulator {
     HttpRoutes.of[IO] {
 
       // -----------------------------------------------------------------
+      // GET /v1/models (roadmap item 15). Same path on both real vendors'
+      // APIs (api.openai.com/v1/models, api.anthropic.com/v1/models) --
+      // unlike chat/completions vs messages, there's no path to
+      // disambiguate on here. Real clients tell them apart by which host
+      // they're configured to hit; llmsim serves both from one host:port,
+      // so it disambiguates the one way that's still genuinely accurate:
+      // the Anthropic SDK always sends an `anthropic-version` header
+      // (required on every real Anthropic API call), the OpenAI SDK
+      // never does. Static and unscripted -- listing available models
+      // isn't part of a conversation, so this doesn't touch the script
+      // or the journal at all.
+      // -----------------------------------------------------------------
+      case req @ GET -> Root / "v1" / "models" =>
+        if (req.headers.get(CIString("anthropic-version")).isDefined) {
+          Ok(Anthropic.ModelList(data = List(
+            Anthropic.ModelInfo(id = "claude-sonnet-5", display_name = "Claude Sonnet 5", created_at = "2026-01-01T00:00:00Z"),
+            Anthropic.ModelInfo(id = "claude-haiku-4-5", display_name = "Claude Haiku 4.5", created_at = "2025-10-01T00:00:00Z")
+          )).asJson)
+        } else {
+          Ok(OpenAI.ModelList(data = List(
+            OpenAI.ModelInfo(id = "gpt-4o-mini", created = 1721692800L, owned_by = "openai"),
+            OpenAI.ModelInfo(id = "gpt-4o", created = 1715558400L, owned_by = "openai")
+          )).asJson)
+        }
+
+      // -----------------------------------------------------------------
       // OpenAI-shaped endpoint
       // -----------------------------------------------------------------
       case req @ POST -> Root / "v1" / "chat" / "completions" =>

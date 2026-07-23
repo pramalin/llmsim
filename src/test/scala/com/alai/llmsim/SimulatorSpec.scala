@@ -742,4 +742,45 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
       }
     }
   }
+
+  "GET /v1/models" - {
+
+    "with no anthropic-version header, returns the OpenAI-shaped list" in {
+      for {
+        c    <- clientFor(Script.exactly(reply("hi")))
+        body <- c.expect[Json](Request[IO](Method.GET, uri"/v1/models"))
+      } yield {
+        body.hcursor.downField("object").as[String] shouldBe Right("list")
+        body.hcursor.downField("data").downArray.downField("id").as[String] shouldBe Right("gpt-4o-mini")
+        body.hcursor.downField("data").downArray.downField("owned_by").as[String] shouldBe Right("openai")
+      }
+    }
+
+    "with an anthropic-version header, returns the Anthropic-shaped list" in {
+      for {
+        c    <- clientFor(Script.exactly(reply("hi")))
+        body <- c.expect[Json](Request[IO](Method.GET, uri"/v1/models")
+                  .putHeaders(Header.Raw(org.typelevel.ci.CIString("anthropic-version"), "2023-06-01")))
+      } yield {
+        body.hcursor.downField("data").downArray.downField("id").as[String] shouldBe Right("claude-sonnet-5")
+        body.hcursor.downField("data").downArray.downField("display_name").as[String] shouldBe Right("Claude Sonnet 5")
+        body.hcursor.downField("has_more").as[Boolean] shouldBe Right(false)
+      }
+    }
+
+    "doesn't touch the script position or the journal" in {
+      for {
+        c      <- clientFor(Script.exactly(reply("a"), reply("b")))
+        _      <- c.expect[Json](Request[IO](Method.GET, uri"/v1/models"))
+        _      <- c.expect[Json](Request[IO](Method.GET, uri"/v1/models"))
+        result <- c.expect[OpenAI.ChatResponse](openAIRequest())
+        calls  <- c.expect[List[CapturedCall]](Request[IO](Method.GET, uri"/_llmsim/calls"))
+      } yield {
+        // Two /v1/models calls didn't consume a step -- this still gets
+        // script step 0 ("a"), not step 2 (which wouldn't even exist).
+        result.choices.head.message.content shouldBe Some("a")
+        calls.size shouldBe 1
+      }
+    }
+  }
 }

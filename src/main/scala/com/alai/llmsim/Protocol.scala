@@ -141,6 +141,16 @@ object OpenAI {
       choices: List[ChunkChoice]
   )
 
+  /** GET /v1/models (roadmap item 15). A minimal, accurate subset of the
+    * real shape -- id/object/created/owned_by -- not the full model
+    * catalog a real deployment would have. Static, not scripted:
+    * listing available models isn't part of a conversation, so there's
+    * no script step to consume and nothing here depends on which step
+    * the current script happens to be on.
+    */
+  final case class ModelInfo(id: String, `object`: String = "model", created: Long, owned_by: String)
+  final case class ModelList(`object`: String = "list", data: List[ModelInfo])
+
   implicit val functionCallCodec: Codec[FunctionCall]   = deriveCodec
   implicit val toolCallCodec: Codec[ToolCall]           = deriveCodec
   implicit val choiceCodec: Codec[Choice]               = deriveCodec
@@ -154,6 +164,8 @@ object OpenAI {
   implicit val deltaCodec: Codec[Delta]                             = deriveCodec
   implicit val chunkChoiceCodec: Codec[ChunkChoice]                 = deriveCodec
   implicit val chatCompletionChunkCodec: Codec[ChatCompletionChunk] = deriveCodec
+  implicit val modelInfoCodec: Codec[ModelInfo]                     = deriveCodec
+  implicit val modelListCodec: Codec[ModelList]                     = deriveCodec
 }
 
 object Anthropic {
@@ -267,6 +279,20 @@ object Anthropic {
   final case class MessageDeltaPayload(`type`: String = "message_delta", delta: MessageDeltaInner, usage: StreamUsage)
   final case class MessageStopPayload(`type`: String = "message_stop")
 
+  /** GET /v1/models (roadmap item 15). Anthropic's real response
+    * carries a large, fast-evolving `capabilities` object per model
+    * (batch/citations/thinking/context-management flags and more) plus
+    * cursor-based pagination (first_id/last_id/has_more, before_id/
+    * after_id query params) -- llmsim models only the stable, load-
+    * bearing subset (id/type/display_name/created_at), matching this
+    * project's consistent "just enough of the real wire format" scope
+    * rather than mirroring the full, actively-changing catalog shape.
+    * `has_more` is always false: llmsim's model list is small, static,
+    * and unpaginated.
+    */
+  final case class ModelInfo(id: String, `type`: String = "model", display_name: String, created_at: String)
+  final case class ModelList(data: List[ModelInfo], has_more: Boolean = false)
+
   implicit val contentBlockCodec: Codec[ContentBlock]         = deriveCodec
   implicit val usageCodec: Codec[Usage]                       = deriveCodec
   implicit val messagesRequestCodec: Codec[MessagesRequest]   = deriveCodec
@@ -283,5 +309,7 @@ object Anthropic {
   implicit val contentBlockStopPayloadCodec: Codec[ContentBlockStopPayload]   = deriveCodec
   implicit val messageDeltaInnerCodec: Codec[MessageDeltaInner]               = deriveCodec
   implicit val messageDeltaPayloadCodec: Codec[MessageDeltaPayload]           = deriveCodec
+  implicit val modelInfoCodec: Codec[ModelInfo]                               = deriveCodec
+  implicit val modelListCodec: Codec[ModelList]                               = deriveCodec
   implicit val messageStopPayloadCodec: Codec[MessageStopPayload]             = deriveCodec
 }
