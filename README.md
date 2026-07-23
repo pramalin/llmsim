@@ -456,6 +456,11 @@ field that tells you which transport was actually used.
   script step or the script running out (`Overrun.Fail`).
 - `"failed"` — the request body couldn't be decoded at all; no script
   step was consumed, so `stepIndex` is `null`.
+- `"cancelled"` — a streamed call whose connection closed (client
+  disconnect) before the stream finished sending. Not reachable yet in
+  practice — nothing today injects a delay long enough for a client to
+  disconnect mid-stream — but modeled now so it's not a breaking change
+  once streaming fault injection can actually trigger it.
 
 Other endpoints:
 
@@ -507,7 +512,7 @@ curl -s http://localhost:8089/_llmsim/dashboard
     "capacity": 1000
   },
   "calls": {
-    "byOutcome": { "responded": 2, "rejected": 0, "failed": 0 },
+    "byOutcome": { "responded": 2, "rejected": 0, "failed": 0, "cancelled": 0 },
     "byProvider": { "openai": 2, "anthropic": 0 },
     "streamed": 0
   },
