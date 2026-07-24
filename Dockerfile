@@ -24,6 +24,13 @@ COPY build.sbt .
 RUN sbt update
 
 COPY src src
+# common/ holds types root now depends on (common.jvm) since the
+# console reorganization -- copied here, not with project/build.sbt
+# above, since it's real source that changes about as often as src/
+# does, not build-definition boilerplate. Only common's source is
+# needed here, not console-tyrian's -- root depends on common.jvm
+# only, never touches Scala.js at all, so nothing here needs Node/npm.
+COPY common common
 RUN sbt assembly
 
 # --- test stage --------------------------------------------------------
