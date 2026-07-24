@@ -426,10 +426,25 @@ duration at construction. Response headers are still set on the HTTP
 response immediately, regardless of either delay — only the body is
 slow.
 
-This is the first of several planned fault types (see the Roadmap for
-what's still ahead: disconnects, malformed events, an omitted completion
-event, and tool-call arguments split across chunks) — all landing as
-more fields on the same `StreamFault`, not new script concepts.
+Any delay longer than `heartbeatInterval` (default 15s, matching a
+common real-world SSE keepalive cadence) gets punctuated with periodic
+SSE comment lines (`: heartbeat`) — valid SSE syntax the spec requires
+conforming parsers to silently ignore, not a real event. This is on by
+default, not something to opt into: a client disconnecting during a
+long delay isn't noticed by llmsim until it next tries to write to that
+connection — confirmed against a real server and a real socket, not
+assumed — and a heartbeat is what forces that write attempt to happen
+regularly instead of only "whenever the next real event happens." Real
+vendor APIs commonly send periodic keepalives for the same reason, so
+this also makes long delays behave more realistically, not merely more
+testable. Set `heartbeatInterval` to `Duration.Zero` to disable it and
+test what a genuinely silent long delay looks like instead.
+
+This is the first two of several planned fault types (see the Roadmap
+for what's still ahead: a real fix for the disconnect-detection latency
+itself, malformed events, an omitted completion event, and tool-call
+arguments split across chunks) — all landing as more fields on the same
+`StreamFault`, not new script concepts.
 
 ## Inspecting captured calls
 
@@ -905,8 +920,8 @@ push ran anything.
 14. Streaming fault injection: delayed first token, delayed inter-token gaps, mid-stream disconnect, malformed SSE event, stream ending without a completion event, tool-call arguments split across chunks, and HTTP 429 before streaming begins. Validated against the item 13 dashboard as each fault type is added, and extend `ci/spring-verification` (item 12) to cover the fault types that matter most for a real client (mid-stream disconnect, split tool-call arguments). In progress, landing in stages:
     - ~~`CallJournal` lifecycle redesign~~ — done: `begin`/`complete` replacing the old single-shot `record`, a `Cancelled` outcome added, and stream completion tied to the frames stream's own `onFinalizeCase` rather than recorded eagerly before the response returns. See `docs/dashboard-design.md`'s sibling reasoning and the commit history for the full "why."
     - ~~Delayed first token, delayed inter-token gaps~~ — done: `StreamFault(delayBeforeFirstEvent, delayBetweenEvents)`, attached to the same `reply`/`toolCall`/`replyFromToolResult` steps — see "Streaming fault injection" above.
-    - Mid-stream disconnect, an omitted completion event — next: where `CallOutcome.Cancelled` actually gets exercised for the first time.
-    - Malformed SSE event, tool-call arguments split across chunks.
+    - Mid-stream disconnect: **confirmed, against a real server and a real socket, that a client disconnecting during a pending delay is not detected until the next write attempt** — fundamental TCP/HTTP-1.1 behavior (the same pattern holds across Jetty, http4s, and akka-http alike), not an Ember-specific gap, and not something a lower-level hook can fix. `heartbeatInterval` (done, see above) is the direct response: it bounds discovery latency to roughly one heartbeat interval by forcing periodic write attempts, rather than eliminating the latency (nothing can). `CallOutcome.Cancelled` on a real disconnect is exercised now — `DisconnectSpec.scala` proves the journal reaches a terminal state promptly once heartbeats are active — but whether a connection-reset `ExitCase.Errored` should ALSO map to `Cancelled` (today it maps to `Failed`) is still an open policy decision, deferred until real-world Ember error shapes are seen in practice.
+    - An omitted completion event, malformed SSE event, tool-call arguments split across chunks.
     - HTTP 429 before streaming begins needs no new mechanism at all — that's today's `Step.Error` used with a streaming request (an error never streams, matching real vendor behavior) — just a wire-level test confirming it, not new implementation.
     - `ci/spring-verification` extensions for disconnect and split-arguments.
 15. `GET /v1/models`.
