@@ -440,11 +440,27 @@ this also makes long delays behave more realistically, not merely more
 testable. Set `heartbeatInterval` to `Duration.Zero` to disable it and
 test what a genuinely silent long delay looks like instead.
 
-This is the first two of several planned fault types (see the Roadmap
-for what's still ahead: a real fix for the disconnect-detection latency
-itself, malformed events, an omitted completion event, and tool-call
-arguments split across chunks) — all landing as more fields on the same
-`StreamFault`, not new script concepts.
+`omitCompletionEvent = true` drops just the terminal "stream is done"
+signal — OpenAI's literal `data: [DONE]\n\n`, Anthropic's
+`message_stop` — while every other frame still sends normally. A model
+that produces real content but never formally signals completion,
+testing whether a client hangs waiting for an end that never comes
+rather than a parse or connection failure.
+
+`malformedEventAt = Some(n)` replaces the frame at that 0-based index
+(the role-announcing delta / `message_start` is index 0) with
+syntactically invalid JSON — a genuine parse failure, not a wrong
+shape, the most common real-world "malformed event" case (a truncated
+or garbled payload from a flaky upstream). Silently has no effect if
+the index is past the actual frame count for that reply's text, since
+frame count depends on word-count chunking a script author doesn't
+directly control — an out-of-range index usually just means the reply
+text changed, not something worth failing loudly over. A negative
+index IS rejected at construction, same as the durations above.
+
+This is four of several planned fault types (see the Roadmap for
+what's still ahead: split tool-call arguments) — all landing as more
+fields on the same `StreamFault`, not new script concepts.
 
 ## Inspecting captured calls
 
@@ -921,7 +937,8 @@ push ran anything.
     - ~~`CallJournal` lifecycle redesign~~ — done: `begin`/`complete` replacing the old single-shot `record`, a `Cancelled` outcome added, and stream completion tied to the frames stream's own `onFinalizeCase` rather than recorded eagerly before the response returns. See `docs/dashboard-design.md`'s sibling reasoning and the commit history for the full "why."
     - ~~Delayed first token, delayed inter-token gaps~~ — done: `StreamFault(delayBeforeFirstEvent, delayBetweenEvents)`, attached to the same `reply`/`toolCall`/`replyFromToolResult` steps — see "Streaming fault injection" above.
     - Mid-stream disconnect: **confirmed, against a real server and a real socket, that a client disconnecting during a pending delay is not detected until the next write attempt** — fundamental TCP/HTTP-1.1 behavior (the same pattern holds across Jetty, http4s, and akka-http alike), not an Ember-specific gap, and not something a lower-level hook can fix. `heartbeatInterval` (done, see above) is the direct response: it bounds discovery latency to roughly one heartbeat interval by forcing periodic write attempts, rather than eliminating the latency (nothing can). `CallOutcome.Cancelled` on a real disconnect is exercised now — `DisconnectSpec.scala` proves the journal reaches a terminal state promptly once heartbeats are active — but whether a connection-reset `ExitCase.Errored` should ALSO map to `Cancelled` (today it maps to `Failed`) is still an open policy decision, deferred until real-world Ember error shapes are seen in practice.
-    - An omitted completion event, malformed SSE event, tool-call arguments split across chunks.
+    - ~~An omitted completion event, malformed SSE event~~ — done: `StreamFault(omitCompletionEvent, malformedEventAt)`, same as the delay fields — see "Streaming fault injection" above.
+    - Tool-call arguments split across chunks — next.
     - ~~HTTP 429 before streaming begins~~ — done: needed no new mechanism at all, confirmed by test rather than assumed — `Step.Error` was already matched identically regardless of `stream: true`, so this was purely a wire-level test confirming a 429 (or any error) is always a plain JSON body, never SSE, matching every real vendor's actual behavior.
     - `ci/spring-verification` extensions for disconnect and split-arguments.
 15. `GET /v1/models`.
