@@ -458,9 +458,22 @@ directly control — an out-of-range index usually just means the reply
 text changed, not something worth failing loudly over. A negative
 index IS rejected at construction, same as the durations above.
 
-This is four of several planned fault types (see the Roadmap for
-what's still ahead: split tool-call arguments) — all landing as more
-fields on the same `StreamFault`, not new script concepts.
+`splitToolCallArguments = n` splits a `toolCall` step's arguments
+string across `n` events instead of sending it whole in one — real
+OpenAI/Anthropic streaming often sends tool-call arguments as
+incremental JSON-string fragments a client is expected to concatenate
+before parsing, not as one complete piece. `1` (the default) means
+"don't split." The tool call's `id`/`name`/`type` still arrive once, in
+the first event only — only the arguments string itself splits,
+matching real vendor behavior. Produces fewer than `n` pieces, never
+padded with empty fragments, if the arguments string is too short to
+split that many ways.
+
+This is every planned fault type from the original roadmap item — all
+landing as fields on the same `StreamFault`, never a new script
+concept to learn. What's left for item 14 is validating a couple of
+these (disconnect, split arguments) against a real Spring AI client in
+`ci/spring-verification`, not further llmsim-side work.
 
 ## Inspecting captured calls
 
@@ -938,7 +951,7 @@ push ran anything.
     - ~~Delayed first token, delayed inter-token gaps~~ — done: `StreamFault(delayBeforeFirstEvent, delayBetweenEvents)`, attached to the same `reply`/`toolCall`/`replyFromToolResult` steps — see "Streaming fault injection" above.
     - Mid-stream disconnect: **confirmed, against a real server and a real socket, that a client disconnecting during a pending delay is not detected until the next write attempt** — fundamental TCP/HTTP-1.1 behavior (the same pattern holds across Jetty, http4s, and akka-http alike), not an Ember-specific gap, and not something a lower-level hook can fix. `heartbeatInterval` (done, see above) is the direct response: it bounds discovery latency to roughly one heartbeat interval by forcing periodic write attempts, rather than eliminating the latency (nothing can). `CallOutcome.Cancelled` on a real disconnect is exercised now — `DisconnectSpec.scala` proves the journal reaches a terminal state promptly once heartbeats are active — but whether a connection-reset `ExitCase.Errored` should ALSO map to `Cancelled` (today it maps to `Failed`) is still an open policy decision, deferred until real-world Ember error shapes are seen in practice.
     - ~~An omitted completion event, malformed SSE event~~ — done: `StreamFault(omitCompletionEvent, malformedEventAt)`, same as the delay fields — see "Streaming fault injection" above.
-    - Tool-call arguments split across chunks — next.
+    - ~~Tool-call arguments split across chunks~~ — done: `StreamFault(splitToolCallArguments)` — see "Streaming fault injection" above. Every planned fault type from this item is now built.
     - ~~HTTP 429 before streaming begins~~ — done: needed no new mechanism at all, confirmed by test rather than assumed — `Step.Error` was already matched identically regardless of `stream: true`, so this was purely a wire-level test confirming a 429 (or any error) is always a plain JSON body, never SSE, matching every real vendor's actual behavior.
     - `ci/spring-verification` extensions for disconnect and split-arguments.
 15. `GET /v1/models`.
