@@ -777,6 +777,73 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
         frames.forall(f => f == "[DONE]" || parseJson(f).isRight) shouldBe true
       }
     }
+
+    "StreamFault rejects splitToolCallArguments < 1 at construction" in {
+      assertThrows[IllegalArgumentException] {
+        StreamFault(splitToolCallArguments = 0)
+      }
+    }
+
+    "splitToolCallArguments splits arguments across multiple chunks, id/name/type only in the first, against OpenAI" in {
+      val args = """{"city":"San Francisco","unit":"celsius"}"""
+      for {
+        c        <- clientFor(Script.exactly(
+                      toolCall(id = "call-1", name = "get_weather", arguments = args,
+                        streamFault = streamFault(splitToolCallArguments = 4))
+                    ))
+        response <- c.expect[String](openAIStreamingRequest("what's the weather?"))
+      } yield {
+        val chunks = parseFrames(response).map(_._2).filterNot(_ == "[DONE]")
+          .flatMap(s => parseJson(s).flatMap(_.as[OpenAI.ChatCompletionChunk]).toOption)
+        val toolCallDeltas = chunks.flatMap(_.choices.head.delta.tool_calls.toList.flatten)
+
+        toolCallDeltas.size should (be > 1 and be <= 4)
+        toolCallDeltas.head.id shouldBe Some("call-1")
+        toolCallDeltas.head.function.flatMap(_.name) shouldBe Some("get_weather")
+        // Every piece AFTER the first carries no id/name -- a client
+        // identifies the call once, then just concatenates arguments.
+        toolCallDeltas.tail.forall(tc => tc.id.isEmpty && tc.function.flatMap(_.name).isEmpty) shouldBe true
+        toolCallDeltas.flatMap(_.function.flatMap(_.arguments)).mkString shouldBe args
+      }
+    }
+
+    "splitToolCallArguments splits partial_json across multiple content_block_delta events, against Anthropic" in {
+      val args = """{"city":"San Francisco","unit":"celsius"}"""
+      for {
+        c        <- clientFor(Script.exactly(
+                      toolCall(id = "call-1", name = "get_weather", arguments = args,
+                        streamFault = streamFault(splitToolCallArguments = 4))
+                    ))
+        response <- c.expect[String](anthropicStreamingRequest("what's the weather?"))
+      } yield {
+        val fragments = parseFrames(response).collect { case (Some("content_block_delta"), data) => data }
+          .flatMap(s =>
+            parseJson(s).flatMap(_.as[Anthropic.ContentBlockDeltaPayload]).toOption
+              .flatMap(_.delta.as[Anthropic.InputJsonDelta].toOption)
+              .map(_.partial_json)
+          )
+        fragments.size should (be > 1 and be <= 4)
+        fragments.mkString shouldBe args
+      }
+    }
+
+    "splitToolCallArguments produces fewer pieces than requested when the arguments are too short to split that many ways" in {
+      for {
+        c        <- clientFor(Script.exactly(
+                      toolCall(id = "call-1", name = "f", arguments = "{}",
+                        streamFault = streamFault(splitToolCallArguments = 50))
+                    ))
+        response <- c.expect[String](openAIStreamingRequest("call f"))
+      } yield {
+        val chunks = parseFrames(response).map(_._2).filterNot(_ == "[DONE]")
+          .flatMap(s => parseJson(s).flatMap(_.as[OpenAI.ChatCompletionChunk]).toOption)
+        val toolCallDeltas = chunks.flatMap(_.choices.head.delta.tool_calls.toList.flatten)
+        // "{}" is 2 characters -- can't produce 50 non-empty pieces,
+        // and nothing pads with empty fragments to fake that count.
+        toolCallDeltas.size should be <= 2
+        toolCallDeltas.flatMap(_.function.flatMap(_.arguments)).mkString shouldBe "{}"
+      }
+    }
   }
 
   "streaming fault injection: errors never stream" - {

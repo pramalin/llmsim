@@ -248,14 +248,25 @@ object Simulator {
                                              choices = List(OpenAI.ChunkChoice(0, delta, finish))).asJson
 
                                          val roleChunk = chunk(OpenAI.Delta(role = Some("assistant")), None)
-                                         val toolChunk = chunk(
-                                           OpenAI.Delta(tool_calls = Some(List(
-                                             OpenAI.ChunkToolCall(index = 0, id = Some(id), `type` = Some("function"),
-                                               function = Some(OpenAI.ChunkFunctionCall(Some(name), Some(arguments))))
-                                           ))), None)
+                                         val argPieces = splitIntoPieces(arguments, streamFault.map(_.splitToolCallArguments).getOrElse(1))
+                                         // id/type/name arrive once, in the FIRST tool-call chunk only --
+                                         // every later piece carries just an arguments fragment, matching
+                                         // real OpenAI streaming (a client identifies the call once, then
+                                         // concatenates arguments fragments as they arrive).
+                                         val toolChunks = argPieces.zipWithIndex.map {
+                                           case (piece, 0) =>
+                                             chunk(OpenAI.Delta(tool_calls = Some(List(
+                                               OpenAI.ChunkToolCall(index = 0, id = Some(id), `type` = Some("function"),
+                                                 function = Some(OpenAI.ChunkFunctionCall(Some(name), Some(piece))))
+                                             ))), None)
+                                           case (piece, _) =>
+                                             chunk(OpenAI.Delta(tool_calls = Some(List(
+                                               OpenAI.ChunkToolCall(index = 0, function = Some(OpenAI.ChunkFunctionCall(None, Some(piece))))
+                                             ))), None)
+                                         }
                                          val finalChunk = chunk(OpenAI.Delta(), Some("tool_calls"))
 
-                                         val renderedFrames = List(roleChunk, toolChunk, finalChunk)
+                                         val renderedFrames = (roleChunk :: toolChunks ::: List(finalChunk))
                                            .map(j => sseFrame(None, j)) :+ "data: [DONE]\n\n"
                                          val frames = paced(applyFrameFaults(renderedFrames, streamFault), streamFault)
 
@@ -486,9 +497,12 @@ object Simulator {
                                                index = 0,
                                                content_block = Anthropic.ContentBlock(`type` = "tool_use", id = Some(id), name = Some(name), input = Some(Json.obj()))
                                              ).asJson
-                                             val inputDelta = Anthropic.ContentBlockDeltaPayload(
-                                               index = 0, delta = Anthropic.InputJsonDelta(partial_json = inputJson.noSpaces).asJson
-                                             ).asJson
+                                             val argPieces = splitIntoPieces(inputJson.noSpaces, streamFault.map(_.splitToolCallArguments).getOrElse(1))
+                                             val inputDeltas: List[(String, Json)] = argPieces.map { piece =>
+                                               ("content_block_delta", Anthropic.ContentBlockDeltaPayload(
+                                                 index = 0, delta = Anthropic.InputJsonDelta(partial_json = piece).asJson
+                                               ).asJson)
+                                             }
                                              val blockStop = Anthropic.ContentBlockStopPayload(index = 0).asJson
                                              val messageDelta = Anthropic.MessageDeltaPayload(
                                                delta = Anthropic.MessageDeltaInner(stop_reason = "tool_use"),
@@ -496,11 +510,10 @@ object Simulator {
                                              ).asJson
                                              val messageStop = Anthropic.MessageStopPayload().asJson
 
-                                             val events: List[(String, Json)] = List(
-                                               ("message_start", messageStart), ("content_block_start", blockStart),
-                                               ("content_block_delta", inputDelta), ("content_block_stop", blockStop),
-                                               ("message_delta", messageDelta), ("message_stop", messageStop)
-                                             )
+                                             val events: List[(String, Json)] =
+                                               List(("message_start", messageStart), ("content_block_start", blockStart)) :::
+                                                 inputDeltas :::
+                                                 List(("content_block_stop", blockStop), ("message_delta", messageDelta), ("message_stop", messageStop))
                                              val renderedFrames = events.map { case (ev, j) => sseFrame(Some(ev), j) }
                                              val frames = paced(applyFrameFaults(renderedFrames, streamFault), streamFault)
 
@@ -854,6 +867,17 @@ object Simulator {
     if (fault.exists(_.omitCompletionEvent) && afterMalformed.nonEmpty) afterMalformed.init
     else afterMalformed
   }
+
+  // Splits s into at most n roughly-equal pieces -- fewer than n if s
+  // is too short to split that many ways (never pads with empty
+  // fragments to hit an exact count). n <= 1 or an empty string is
+  // just List(s) unchanged, matching every other fault field's "off
+  // by default" behavior. Used for splitToolCallArguments: real
+  // OpenAI/Anthropic streaming often sends a tool call's arguments as
+  // incremental JSON-string fragments, not one complete piece.
+  private def splitIntoPieces(s: String, n: Int): List[String] =
+    if (n <= 1 || s.isEmpty) List(s)
+    else s.grouped(math.ceil(s.length.toDouble / n).toInt.max(1)).toList
 
   // A script-provided UsageOverride is used verbatim when present -- for
   // testing behavior at a specific token count precisely (a budget check,

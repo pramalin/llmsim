@@ -20,10 +20,10 @@ final case class UsageOverride(promptTokens: Int, completionTokens: Int) {
   * streamed response -- ignored entirely for a non-streaming call to
   * the same step, since these are transport-level effects with
   * nothing meaningful to mean outside SSE. "Fault" is the umbrella
-  * name for roadmap item 14 as a whole (split tool-call arguments is
-  * this case class's next field, not a new type) -- adding fields
-  * here as each one lands keeps every existing script, which never
-  * mentions StreamFault at all, compiling unchanged throughout. The delay fields specifically
+  * name for roadmap item 14 as a whole -- every planned fault type is
+  * a field on this one case class, not a separate type, so adding one
+  * keeps every existing script, which never mentions StreamFault at
+  * all, compiling unchanged throughout. The delay fields specifically
   * aren't inherently "faulty," though: a real model can legitimately
   * be slow to start or slow to keep generating, and these two fields
   * exist to represent that as much as any deliberately broken
@@ -93,12 +93,31 @@ final case class StreamFault(
     // failing loudly over. A negative index IS rejected at
     // construction, same as the durations above -- that's
     // unambiguously a script bug, not a framing mismatch.
-    malformedEventAt: Option[Int] = None
+    malformedEventAt: Option[Int] = None,
+    // Splits a ToolCall step's arguments string across this many SSE
+    // events instead of sending it whole in one -- real OpenAI/
+    // Anthropic streaming often sends tool-call arguments as
+    // incremental JSON-string fragments a client is expected to
+    // concatenate before parsing, not as one complete piece. `1`
+    // (the default) means "don't split," matching every other
+    // ToolCall streaming behavior this project shipped before this
+    // field existed -- bare Int with 1 as identity, same convention
+    // as Duration.Zero/false/None elsewhere on this case class, no
+    // Option-wrapping needed since there's a natural "off" value. Has
+    // no effect on the id/name/type fields (those still arrive whole,
+    // in the first event only, matching real vendor behavior where
+    // only the arguments string streams incrementally) or on a
+    // non-streaming response to the same step. Silently produces
+    // fewer than the requested number of pieces if the arguments
+    // string is too short to split that many ways, rather than
+    // padding with empty fragments.
+    splitToolCallArguments: Int = 1
 ) {
   require(delayBeforeFirstEvent >= Duration.Zero, s"delayBeforeFirstEvent must be >= 0, got $delayBeforeFirstEvent")
   require(delayBetweenEvents >= Duration.Zero, s"delayBetweenEvents must be >= 0, got $delayBetweenEvents")
   require(heartbeatInterval >= Duration.Zero, s"heartbeatInterval must be >= 0, got $heartbeatInterval")
   malformedEventAt.foreach(i => require(i >= 0, s"malformedEventAt must be >= 0, got $i"))
+  require(splitToolCallArguments >= 1, s"splitToolCallArguments must be >= 1, got $splitToolCallArguments")
 }
 
 /** A single call gets answered by one Step.
@@ -217,9 +236,13 @@ object Script {
       delayBetweenEvents: FiniteDuration = Duration.Zero,
       heartbeatInterval: FiniteDuration = 15.seconds,
       omitCompletionEvent: Boolean = false,
-      malformedEventAt: Option[Int] = None
+      malformedEventAt: Option[Int] = None,
+      splitToolCallArguments: Int = 1
   ): Option[StreamFault] =
-    Some(StreamFault(delayBeforeFirstEvent, delayBetweenEvents, heartbeatInterval, omitCompletionEvent, malformedEventAt))
+    Some(StreamFault(
+      delayBeforeFirstEvent, delayBetweenEvents, heartbeatInterval,
+      omitCompletionEvent, malformedEventAt, splitToolCallArguments
+    ))
 }
 
 /** Every startup script is a Scala object implementing this trait. Main
