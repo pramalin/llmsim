@@ -5,6 +5,7 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.time.Duration;
 
 /**
  * llmsim has exactly one script cursor per running instance -- no
@@ -41,5 +42,46 @@ final class LlmsimTestSupport {
             throw new IllegalStateException("Could not reset llmsim at " + baseUrl
                     + " -- is it running with LLMSIM_SCRIPT=com.alai.llmsim.scripts.VerificationFlow?", e);
         }
+    }
+
+    /**
+     * Polls GET /_llmsim/calls every 500ms until it returns a non-empty
+     * array or the timeout elapses -- the same "poll rather than guess
+     * a single wait" discipline llmsim's own DisconnectSpec.scala test
+     * uses, and for the same reason: TCP-level detection of a dead
+     * connection commonly needs more than one write attempt to
+     * surface, so a single fixed wait is fragile regardless of how
+     * generous it looks on paper.
+     *
+     * A deliberately loose check -- "the journal is non-empty" rather
+     * than decoding and asserting a specific CallOutcome -- since this
+     * module's job is confirming Spring AI's real client behaves
+     * correctly against llmsim, not re-verifying llmsim's own journal
+     * shape, which SimulatorSpec.scala and DisconnectSpec.scala in the
+     * main project already cover thoroughly.
+     */
+    static boolean pollForNonEmptyJournal(Duration timeout) {
+        String baseUrl = System.getenv().getOrDefault("LLMSIM_ANTHROPIC_BASE_URL", "http://localhost:8089");
+        HttpRequest request = HttpRequest.newBuilder(URI.create(baseUrl + "/_llmsim/calls")).GET().build();
+        long deadlineNanos = System.nanoTime() + timeout.toNanos();
+        while (System.nanoTime() < deadlineNanos) {
+            try {
+                HttpResponse<String> response = HttpClient.newHttpClient()
+                        .send(request, HttpResponse.BodyHandlers.ofString());
+                if (response.statusCode() / 100 == 2 && !response.body().trim().equals("[]")) {
+                    return true;
+                }
+            } catch (IOException | InterruptedException e) {
+                // Fall through and retry -- a transient failure here
+                // shouldn't end the poll early.
+            }
+            try {
+                Thread.sleep(500);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+        return false;
     }
 }

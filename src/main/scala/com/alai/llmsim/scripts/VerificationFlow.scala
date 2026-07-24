@@ -2,9 +2,10 @@ package com.alai.llmsim.scripts
 
 import com.alai.llmsim.{Script, ScriptSource}
 import com.alai.llmsim.Script._
+import scala.concurrent.duration._
 
 /** Boots llmsim for ci/spring-verification (see VerificationTest there).
-  * Eleven steps, each consumed by exactly one test, in order, with no
+  * Thirteen steps, each consumed by exactly one test, in order, with no
   * warmup or discard calls:
   *   0. A plain text reply -- OpenAI-shaped basic ChatClient check.
   *   1. The same reply again -- Anthropic-shaped basic ChatClient check
@@ -37,6 +38,22 @@ import com.alai.llmsim.Script._
   *      that its tool-calling advisor correctly recognizes a tool call
   *      assembled across streamed chunks, invokes the real Java
   *      callback, and streams the final answer from the real result.
+  *  11. A fifth, distinct tool call, streamed, with its arguments split
+  *      across 4 chunks (StreamFault.splitToolCallArguments) -- proves
+  *      Spring AI's real client-side fragment-reassembly logic, not
+  *      just that llmsim's own wire-level tests think the split is
+  *      well-formed.
+  *  12. A multi-word reply with a 20s gap between its second and third
+  *      word, plus a short 2s heartbeat -- the test that consumes this
+  *      step deliberately abandons the stream after its first element
+  *      (Flux.take(1)), checking whether llmsim's journal reaches a
+  *      terminal state well before the full 20s, through Spring AI's
+  *      REAL client (Reactor Netty) rather than the raw socket
+  *      llmsim's own DisconnectSpec.scala already used. Confirms (or
+  *      would expose a gap in) whether that client's connection
+  *      pooling/reuse behavior actually closes the underlying
+  *      connection promptly when a subscriber gives up, which a raw
+  *      socket test can't observe on its own.
   *
   * Kept in llmsim's own scripts package, not the verification module,
   * since Main loads scripts by fully-qualified name off llmsim's own
@@ -64,6 +81,12 @@ object VerificationFlow extends ScriptSource {
     reply("hello there world"),
     toolCall(id = "call-3", name = "get_weather", arguments = """{"city":"Seattle"}"""),
     toolCall(id = "call-4", name = "get_weather", arguments = """{"city":"Denver"}"""),
-    replyFromToolResult("call-4")(result => s"Streamed tool result: $result")
+    replyFromToolResult("call-4")(result => s"Streamed tool result: $result"),
+    toolCall(id = "call-5", name = "get_weather", arguments = """{"city":"Miami"}""",
+      streamFault = streamFault(splitToolCallArguments = 4)),
+    reply(
+      "this reply is abandoned before it finishes",
+      streamFault = streamFault(delayBetweenEvents = 20.seconds, heartbeatInterval = 2.seconds)
+    )
   )
 }

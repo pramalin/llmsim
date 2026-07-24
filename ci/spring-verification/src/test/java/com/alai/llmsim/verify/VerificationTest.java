@@ -43,8 +43,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * warmups, no discards, no room for retry amplification to matter.
  *
  * Requires llmsim running with
- * LLMSIM_SCRIPT=com.alai.llmsim.scripts.VerificationFlow, whose eleven
- * steps this class's ten tests (the fifth disabled) consume in order.
+ * LLMSIM_SCRIPT=com.alai.llmsim.scripts.VerificationFlow, whose thirteen
+ * steps this class's twelve tests (the fifth disabled) consume in order.
  */
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 @SpringBootTest(classes = VerificationApplication.class)
@@ -245,5 +245,78 @@ class VerificationTest {
         String answer = String.join("", tokens);
         assertThat(answer).contains("Streamed tool result");
         assertThat(answer).contains("72F and sunny in Denver");
+    }
+
+    @Order(11)
+    @Test
+    void openAiShapedClientReassemblesSplitToolCallArguments() {
+        // VerificationFlow step 11: llmsim splits this tool call's
+        // arguments across 4 separate streamed chunks instead of
+        // sending them whole in one (StreamFault.splitToolCallArguments)
+        // -- confirms Spring AI's real client-side fragment-reassembly
+        // logic, not just that llmsim's own wire-level tests
+        // (SimulatorSpec.scala) think the split is well-formed. Same
+        // shape as step 8's openAiShapedClientSurfacesTheStreamedToolCall
+        // -- parsing only, no tool registered here on purpose.
+        Prompt prompt = new Prompt(List.of(new UserMessage("what is the weather in Miami?")));
+        Flux<ChatResponse> stream = openAiChatModel.stream(prompt);
+
+        List<ChatResponse> chunks = stream.collectList().block(Duration.ofSeconds(10));
+
+        assertThat(chunks).isNotNull().isNotEmpty();
+
+        ChatResponse toolCallChunk = chunks.stream()
+                .filter(c -> c.getResult() != null && c.getResult().getOutput() != null
+                        && c.getResult().getOutput().hasToolCalls())
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("no chunk in the stream carried a tool call: " + chunks));
+
+        assertThat(toolCallChunk.getResult().getOutput().getToolCalls().get(0).name()).isEqualTo("get_weather");
+        assertThat(toolCallChunk.getResult().getOutput().getToolCalls().get(0).arguments())
+                .isEqualTo("{\"city\":\"Miami\"}");
+    }
+
+    @Order(12)
+    @Test
+    void abandoningAStreamedResponseIsDetectedPromptlyByLlmsim() {
+        // VerificationFlow step 12. llmsim's own DisconnectSpec.scala
+        // already confirmed end to end, with a raw socket, that a
+        // client disconnecting during a pending delay is eventually
+        // detected. What this checks is different: whether Spring AI's
+        // REAL client (Reactor Netty, under WebClient) actually closes
+        // the underlying connection when a Flux subscriber gives up --
+        // or whether connection pooling/reuse masks that from llmsim's
+        // side, something a raw-socket test can't observe on its own.
+        //
+        // take(Duration), not take(1): .content() almost certainly
+        // filters to text-bearing deltas only, skipping the role-only
+        // announcement chunk that carries no text -- so the first
+        // element Flux<String> actually emits is the reply's first
+        // WORD, which is already behind VerificationFlow step 12's
+        // scripted delayBetweenEvents gap (that field delays every
+        // frame from index 1 onward, and the first word is frame 1).
+        // take(1) genuinely has nothing to grab within any reasonable
+        // wait, timing out even though nothing is actually broken --
+        // confirmed by a real failed run, not assumed. A duration-based
+        // take abandons the subscription after a fixed time regardless
+        // of how many elements (zero or more) arrived first, correctly
+        // mimicking a real caller giving up without depending on
+        // exactly which frame counts as "first" from the client's
+        // perspective.
+        Flux<String> stream = ChatClient.create(openAiChatModel).prompt("hello").stream().content();
+        stream.take(Duration.ofMillis(500)).blockLast(Duration.ofSeconds(5));
+
+        // The scripted gap is 20s with a 2s heartbeat (see
+        // VerificationFlow step 12); if heartbeat-driven detection is
+        // working through this real client too, the journal should
+        // reach a terminal state well before that -- not exactly
+        // instantly, same real-world caveat DisconnectSpec.scala's own
+        // test documents and works around by polling rather than
+        // asserting a single fixed wait.
+        boolean detected = LlmsimTestSupport.pollForNonEmptyJournal(Duration.ofSeconds(8));
+        assertThat(detected)
+                .as("llmsim's journal should reach a terminal state well before the 20s scripted delay "
+                        + "once the real Spring AI client abandons the stream")
+                .isTrue();
     }
 }
