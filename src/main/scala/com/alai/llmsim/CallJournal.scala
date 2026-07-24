@@ -1,117 +1,41 @@
 package com.alai.llmsim
 
 import cats.effect.{IO, Ref}
-import io.circe.{Codec, Decoder, Encoder, Json}
-import io.circe.generic.semiauto.deriveCodec
+import io.circe.Json
 
-/** A message from the request, in a shape that doesn't require knowing
-  * whether it came in as OpenAI's flat `content: String` or Anthropic's
-  * `content: List[ContentBlock]` -- both get normalized to this.
+/** A message from the request -- moved to `common` (see
+  * CapturedMessage.scala there), shared with the console. Same
+  * package, so nothing here needed to change beyond removing this
+  * duplicate definition.
   */
-final case class CapturedMessage(role: String, content: String)
-object CapturedMessage {
-  implicit val codec: Codec[CapturedMessage] = deriveCodec
-}
 
-/** A response header llmsim actually emitted, most commonly from a
-  * script's `headers` field (rate-limit headers, `retry-after`, etc.).
-  * `Vector[CapturedHeader]` rather than `Map[String, String]`
-  * deliberately -- captured wire data should preserve duplicate names,
-  * original casing, and original order, none of which a Map can. The
-  * public script DSL still accepts a Map for convenience; this is only
-  * what got recorded after the fact.
+/** A response header llmsim actually emitted -- moved to `common`
+  * (see CapturedHeader.scala there), shared with the console. Same
+  * package, so nothing here needed to change beyond removing this
+  * duplicate definition.
   */
-final case class CapturedHeader(name: String, value: String)
-object CapturedHeader {
-  implicit val codec: Codec[CapturedHeader] = deriveCodec
-}
 
-/** What the simulator did with a call. Four cases:
-  *   - Responded: answered normally (a Reply step, or Overrun.RepeatLast/Cycle)
-  *   - Rejected: answered with a deliberate error -- either an Error step,
-  *     or Overrun.Fail (the script ran out)
-  *   - Failed: the request body couldn't even be decoded into the
-  *     expected shape; no script step was consumed
-  *   - Cancelled: a streamed call whose connection closed (client
-  *     disconnect) before the stream finished sending. Only reachable
-  *     once fault injection can actually make a stream long-lived
-  *     enough for a disconnect to land mid-flight -- modeled now,
-  *     ahead of that landing, since it's the same CallOutcome sealed
-  *     trait either way and there's no reason to make it a breaking
-  *     change later.
-  *
-  * Encoded as flat JSON with a "type" discriminator (rather than circe's
-  * default nested-object encoding for sealed traits), since the intended
-  * consumer is a test harness in any language, not just Scala.
+/** What the simulator did with a call -- moved to `common` (see
+  * CallOutcome.scala there), shared with the console. Same package,
+  * so nothing here needed to change beyond removing this duplicate
+  * definition.
   */
-sealed trait CallOutcome
-object CallOutcome {
-  final case class Responded(status: Int, body: Json) extends CallOutcome
-  final case class Rejected(status: Int, message: String) extends CallOutcome
-  final case class Failed(message: String) extends CallOutcome
-  final case class Cancelled(message: String) extends CallOutcome
 
-  implicit val encoder: Encoder[CallOutcome] = Encoder.instance {
-    case Responded(status, body) =>
-      Json.obj("type" -> Json.fromString("responded"), "status" -> Json.fromInt(status), "body" -> body)
-    case Rejected(status, message) =>
-      Json.obj("type" -> Json.fromString("rejected"), "status" -> Json.fromInt(status), "message" -> Json.fromString(message))
-    case Failed(message) =>
-      Json.obj("type" -> Json.fromString("failed"), "message" -> Json.fromString(message))
-    case Cancelled(message) =>
-      Json.obj("type" -> Json.fromString("cancelled"), "message" -> Json.fromString(message))
-  }
-
-  implicit val decoder: Decoder[CallOutcome] = Decoder.instance { c =>
-    c.get[String]("type").flatMap {
-      case "responded" => for { s <- c.get[Int]("status"); b <- c.get[Json]("body") } yield Responded(s, b)
-      case "rejected"  => for { s <- c.get[Int]("status"); m <- c.get[String]("message") } yield Rejected(s, m)
-      case "failed"    => c.get[String]("message").map(Failed(_))
-      case "cancelled" => c.get[String]("message").map(Cancelled(_))
-      case other       => Left(io.circe.DecodingFailure(s"unknown CallOutcome type: $other", c.history))
-    }
-  }
-}
-
-/** One call the simulator received.
-  *
-  * `rawRequest` is the JSON exactly as sent -- for anything llmsim
-  * doesn't itself model. `model`/`messages` are normalized so a test
-  * doesn't need to know both vendors' shapes just to check what was
-  * asked. `stepIndex` is which script step answered it (0-based), or
-  * `None` for Overrun.Fail or a Failed decode -- there was no step to
-  * attribute it to.
+/** One call the simulator received -- moved to `common` (see
+  * CapturedCall.scala there), shared with the console. Same package,
+  * so nothing here needed to change beyond removing this duplicate
+  * definition. Gained a proper companion-object codec in the move --
+  * see that file for why.
   */
-final case class CapturedCall(
-    sequence: Long,
-    provider: String,
-    model: Option[String],
-    messages: Vector[CapturedMessage],
-    rawRequest: Json,
-    outcome: CallOutcome,
-    stepIndex: Option[Int],
-    receivedAtEpochMillis: Long,
-    completedAtEpochMillis: Long,
-    // From a monotonic clock, not (completedAtEpochMillis - receivedAtEpochMillis)
-    // -- real/wall-clock time can jump (NTP adjustment, clock skew) and
-    // is the wrong source for measuring elapsed duration.
-    durationMillis: Long,
-    // Empty for the common case (no script-level headers, or a
-    // synthetic llmsim-internal error where the step's own headers
-    // don't apply).
-    responseHeaders: Vector[CapturedHeader] = Vector.empty,
-    // True if this call was answered as SSE (request had "stream": true
-    // and got a text/event-stream response). outcome.body still records
-    // the same logical response shape a non-streaming call would have
-    // gotten -- this flag is the only thing that tells a reader which
-    // transport was actually used.
-    streamed: Boolean = false
-)
 
 /** A reservation from `CallJournal.begin`, carrying everything
   * `complete` needs to build the final record. Plain, immutable data --
   * no shared mutable state beyond the sequence number itself, which is
   * reserved atomically at `begin` time.
+  *
+  * Stays here, not in `common` -- purely a server-internal detail
+  * (never JSON-encoded, never sent to any client), unlike CapturedCall
+  * and the other three moved types, which all cross the wire.
   */
 final case class CallHandle(
     sequence: Long,
