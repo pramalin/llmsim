@@ -791,7 +791,12 @@ object Simulator {
   // no-delay path. Plain Stream.emits(frames) when fault is None or
   // specifies no delays at all -- the non-faulted path this project
   // has relied on since SSE first shipped is untouched.
-  private def paced(frames: List[String], fault: Option[StreamFault]): Stream[IO, String] = {
+  // private[llmsim], not private: the isolated cancellation test (see
+  // DisconnectSpec.scala) calls this directly, to verify the delay
+  // mechanism itself cooperates with cancellation independent of any
+  // HTTP plumbing -- see docs/ for the design note this responds to.
+  // Still not part of the public API a script author would ever touch.
+  private[llmsim] def paced(frames: List[String], fault: Option[StreamFault]): Stream[IO, String] = {
     val beforeFirst = fault.map(_.delayBeforeFirstEvent).filter(_ > Duration.Zero)
     val between     = fault.map(_.delayBetweenEvents).filter(_ > Duration.Zero)
     frames.zipWithIndex.foldLeft(Stream.empty: Stream[IO, String]) { case (acc, (frame, i)) =>
