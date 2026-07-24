@@ -34,6 +34,8 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
     jsonEncoderOf[IO, Anthropic.MessagesRequest]
   private implicit val anthropicRespDec: EntityDecoder[IO, Anthropic.MessagesResponse] =
     jsonOf[IO, Anthropic.MessagesResponse]
+  private implicit val anthropicErrDec: EntityDecoder[IO, Anthropic.ErrorBody] =
+    jsonOf[IO, Anthropic.ErrorBody]
 
   private implicit val capturedCallDecoder: Decoder[CapturedCall] = deriveDecoder
   private implicit val callRespDec: EntityDecoder[IO, CapturedCall] =
@@ -685,6 +687,48 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
       } yield {
         val heartbeatCount = response.split(": heartbeat", -1).length - 1
         heartbeatCount shouldBe 2
+      }
+    }
+  }
+
+  "streaming fault injection: errors never stream" - {
+
+    // No new mechanism needed for this -- Step.Error is matched
+    // identically regardless of whether the request set "stream":
+    // true (see Simulator.scala: there's exactly one Step.Error case
+    // per provider, not a streaming/non-streaming split like Reply/
+    // ToolCall/ReplyFromToolResult have). This just confirms that
+    // holds, matching every real vendor's actual behavior: a 429 (or
+    // any error) happens before a response body -- streamed or not --
+    // has even begun, so it's always a plain JSON error, never SSE.
+
+    "an Error step returns a plain JSON body, not SSE, even when the request set stream: true" in {
+      for {
+        c    <- clientFor(Script.exactly(error(429, "rate limited by script")))
+        resp <- c.run(openAIStreamingRequest()).use { r =>
+                  r.as[OpenAI.ErrorBody].map(body => (r.status, r.headers, body))
+                }
+      } yield {
+        val (status, headers, body) = resp
+        status shouldBe Status.TooManyRequests
+        body.error.message shouldBe "rate limited by script"
+        headers.get(org.typelevel.ci.CIString("Content-Type")).map(_.head.value) shouldBe
+          Some("application/json")
+      }
+    }
+
+    "the same holds against the Anthropic-shaped endpoint" in {
+      for {
+        c    <- clientFor(Script.exactly(error(429, "rate limited by script")))
+        resp <- c.run(anthropicStreamingRequest()).use { r =>
+                  r.as[Anthropic.ErrorBody].map(body => (r.status, r.headers, body))
+                }
+      } yield {
+        val (status, headers, body) = resp
+        status shouldBe Status.TooManyRequests
+        body.error.message shouldBe "rate limited by script"
+        headers.get(org.typelevel.ci.CIString("Content-Type")).map(_.head.value) shouldBe
+          Some("application/json")
       }
     }
   }
