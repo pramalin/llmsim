@@ -791,18 +791,44 @@ object Simulator {
   // no-delay path. Plain Stream.emits(frames) when fault is None or
   // specifies no delays at all -- the non-faulted path this project
   // has relied on since SSE first shipped is untouched.
+  //
+  // Any delay longer than heartbeatInterval gets broken into shorter
+  // chunks punctuated by an SSE comment line (HeartbeatFrame) -- see
+  // StreamFault's own doc comment for why: a confirmed finding, not a
+  // guess, that a real disconnect isn't noticed until the next write
+  // attempt, so breaking a long silence into periodic writes is what
+  // actually bounds discovery latency, rather than working around a
+  // gap that turned out not to be fixable at a lower level.
+  //
   // private[llmsim], not private: the isolated cancellation test (see
   // DisconnectSpec.scala) calls this directly, to verify the delay
   // mechanism itself cooperates with cancellation independent of any
   // HTTP plumbing -- see docs/ for the design note this responds to.
   // Still not part of the public API a script author would ever touch.
+  private val HeartbeatFrame = ": heartbeat\n\n"
+
+  private def pacedDelay(d: FiniteDuration, heartbeatInterval: FiniteDuration): Stream[IO, String] =
+    if (d <= Duration.Zero) {
+      Stream.empty
+    } else if (heartbeatInterval <= Duration.Zero || d <= heartbeatInterval) {
+      Stream.sleep[IO](d).drain
+    } else {
+      val fullBeats = (d.toMillis / heartbeatInterval.toMillis).toInt
+      val remainder = d - heartbeatInterval * fullBeats.toLong
+      val beats = List.fill(fullBeats)(()).foldLeft(Stream.empty: Stream[IO, String]) { (acc, _) =>
+        acc ++ Stream.sleep[IO](heartbeatInterval).drain ++ Stream.emit(HeartbeatFrame)
+      }
+      beats ++ Stream.sleep[IO](remainder).drain
+    }
+
   private[llmsim] def paced(frames: List[String], fault: Option[StreamFault]): Stream[IO, String] = {
+    val heartbeatInterval = fault.map(_.heartbeatInterval).getOrElse(Duration.Zero)
     val beforeFirst = fault.map(_.delayBeforeFirstEvent).filter(_ > Duration.Zero)
     val between     = fault.map(_.delayBetweenEvents).filter(_ > Duration.Zero)
     frames.zipWithIndex.foldLeft(Stream.empty: Stream[IO, String]) { case (acc, (frame, i)) =>
       val delay = if (i == 0) beforeFirst else between
-      val delayed = delay.map(d => Stream.sleep[IO](d)).getOrElse(Stream.empty: Stream[IO, Unit])
-      acc ++ delayed.drain ++ Stream.emit(frame)
+      val delayed = delay.map(d => pacedDelay(d, heartbeatInterval)).getOrElse(Stream.empty: Stream[IO, String])
+      acc ++ delayed ++ Stream.emit(frame)
     }
   }
 

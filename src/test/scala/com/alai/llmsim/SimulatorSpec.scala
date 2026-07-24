@@ -668,6 +668,25 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
         after  <- Clock[IO].monotonic
       } yield (after - before) should be >= delay
     }
+
+    "a delay longer than heartbeatInterval is punctuated by SSE comment lines" in {
+      // 250ms delay, 100ms heartbeat -> floor(250/100) = 2 full
+      // intervals, then a 50ms remainder before the real frame. The
+      // heartbeat is a bare SSE comment line (": heartbeat\n\n") --
+      // valid, spec-required-to-be-ignored syntax, not a real event,
+      // so it doesn't appear in any of the reconstructed-text
+      // assertions elsewhere in this file; it's only visible in the
+      // raw wire response, which is what this test checks directly.
+      for {
+        c        <- clientFor(Script.exactly(
+                      reply("hi", streamFault = streamFault(delayBeforeFirstEvent = 250.millis, heartbeatInterval = 100.millis))
+                    ))
+        response <- c.expect[String](openAIStreamingRequest())
+      } yield {
+        val heartbeatCount = response.split(": heartbeat", -1).length - 1
+        heartbeatCount shouldBe 2
+      }
+    }
   }
 
   "OpenAI SSE streaming" - {

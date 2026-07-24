@@ -1,6 +1,6 @@
 package com.alai.llmsim
 
-import scala.concurrent.duration.{Duration, FiniteDuration}
+import scala.concurrent.duration._
 
 /** An explicit token count a script pins to a step, instead of relying on
   * llmsim's word-count heuristic. `promptTokens`/`completionTokens` map
@@ -45,13 +45,40 @@ final case class UsageOverride(promptTokens: Int, completionTokens: Int) {
   * helper (see below) takes ordinary durations for the same reason.
   * The outer `Option[StreamFault]` on each step is a different
   * question -- "was a fault configured at all" -- and stays optional.
+  *
+  * `heartbeatInterval` exists because of a confirmed finding, not
+  * speculatively: a real TCP client disconnecting during a pending
+  * delay is NOT noticed until the server's next write attempt --
+  * confirmed against a real Ember server and a real socket, not
+  * inferred (see DisconnectSpec.scala and the project's design
+  * discussion). This is fundamental TCP/HTTP-1.1 behavior, not an
+  * Ember gap -- the same pattern holds across Jetty, http4s, and
+  * akka-http alike, since there's no independent "the OS told me the
+  * socket closed" signal separate from attempting to write. A
+  * heartbeat is a periodic SSE *comment* line (any line starting with
+  * `:`, which the SSE spec requires conforming parsers to silently
+  * ignore) sent during an otherwise-long gap, specifically to force
+  * that write attempt more often than "whenever the next real event
+  * happens" -- turning a potentially very late disconnect discovery
+  * into one bounded by roughly this interval. On by default (15s,
+  * matching a common real-world SSE keepalive cadence) whenever
+  * either delay is long enough to need it, not something a script has
+  * to remember to opt into -- real vendor APIs commonly send periodic
+  * keepalives during long streams for exactly this reason, so this
+  * also makes llmsim's simulated behavior more realistic, not merely
+  * more testable. A script that specifically wants to test what
+  * happens with NO keepalives at all can set this to `Duration.Zero`
+  * to disable it, same "zero means off" convention as the two delay
+  * fields above.
   */
 final case class StreamFault(
     delayBeforeFirstEvent: FiniteDuration = Duration.Zero,
-    delayBetweenEvents: FiniteDuration = Duration.Zero
+    delayBetweenEvents: FiniteDuration = Duration.Zero,
+    heartbeatInterval: FiniteDuration = 15.seconds
 ) {
   require(delayBeforeFirstEvent >= Duration.Zero, s"delayBeforeFirstEvent must be >= 0, got $delayBeforeFirstEvent")
   require(delayBetweenEvents >= Duration.Zero, s"delayBetweenEvents must be >= 0, got $delayBetweenEvents")
+  require(heartbeatInterval >= Duration.Zero, s"heartbeatInterval must be >= 0, got $heartbeatInterval")
 }
 
 /** A single call gets answered by one Step.
@@ -167,9 +194,10 @@ object Script {
   // StreamFault's own doc comment.
   def streamFault(
       delayBeforeFirstEvent: FiniteDuration = Duration.Zero,
-      delayBetweenEvents: FiniteDuration = Duration.Zero
+      delayBetweenEvents: FiniteDuration = Duration.Zero,
+      heartbeatInterval: FiniteDuration = 15.seconds
   ): Option[StreamFault] =
-    Some(StreamFault(delayBeforeFirstEvent, delayBetweenEvents))
+    Some(StreamFault(delayBeforeFirstEvent, delayBetweenEvents, heartbeatInterval))
 }
 
 /** Every startup script is a Scala object implementing this trait. Main

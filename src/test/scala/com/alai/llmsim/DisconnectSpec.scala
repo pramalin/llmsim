@@ -30,6 +30,57 @@ class DisconnectSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
   private implicit val callsEntityDecoder: EntityDecoder[IO, List[CapturedCall]] =
     jsonOf[IO, List[CapturedCall]]
 
+  private val requestBody = """{"model":"gpt-4o-mini","stream":true,"messages":[{"role":"user","content":"hi"}]}"""
+
+  // Blocking, hand-rolled HTTP/1.1 -- deliberately not using any http4s
+  // or java.net.http client, all of which manage connection lifecycle
+  // themselves in ways that could mask what a genuinely abandoned
+  // connection looks like. Reads only the status line and headers
+  // (stops at the blank line separator), then closes -- never touches
+  // the body, which is exactly the scenario in question.
+  private def probeAndDisconnect(port: Int): IO[Unit] = IO.blocking {
+    val socket = new java.net.Socket("127.0.0.1", port)
+    try {
+      socket.setSoTimeout(5000)
+      val bodyBytes = requestBody.getBytes("UTF-8")
+      val request =
+        "POST /v1/chat/completions HTTP/1.1\r\n" +
+          s"Host: 127.0.0.1:$port\r\n" +
+          "Content-Type: application/json\r\n" +
+          s"Content-Length: ${bodyBytes.length}\r\n" +
+          "Connection: close\r\n\r\n"
+      val out = socket.getOutputStream
+      out.write(request.getBytes("UTF-8"))
+      out.write(bodyBytes)
+      out.flush()
+
+      val in = new java.io.BufferedReader(new java.io.InputStreamReader(socket.getInputStream, "UTF-8"))
+      var line = in.readLine()
+      // Status line, then headers until the blank-line separator --
+      // never reads into the body.
+      while (line != null && line.nonEmpty) {
+        line = in.readLine()
+      }
+    } finally {
+      socket.close() // the actual disconnect these tests are about
+    }
+  }
+
+  private def queryJournal(httpApp: HttpApp[IO]): IO[List[CapturedCall]] =
+    httpApp.run(Request[IO](Method.GET, uri"/_llmsim/calls")).flatMap(_.as[List[CapturedCall]])
+
+  private def bootServerAndProbe[A](script: Script)(use: (HttpApp[IO], org.http4s.server.Server) => IO[A]): IO[A] =
+    for {
+      httpApp <- App.build(script)
+      result  <- EmberServerBuilder
+                   .default[IO]
+                   .withHost(host"127.0.0.1")
+                   .withPort(port"0")
+                   .withHttpApp(httpApp)
+                   .build
+                   .use(server => use(httpApp, server))
+    } yield result
+
   // -----------------------------------------------------------------
   // Test 1: isolated cancellation, no HTTP involved at all. Confirms
   // Simulator.paced's own delay mechanism cooperates with explicit
@@ -114,76 +165,28 @@ class DisconnectSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
   // test is obsolete in its current form.
   "a real client closing its connection is NOT detected promptly today -- confirmed gap, not yet fixed" in {
     val delay = 5.seconds
+    // heartbeatInterval explicitly disabled (Duration.Zero) -- this
+    // test characterizes the gap heartbeats exist to bound, so it
+    // needs the gap actually present, not masked by the new default.
+    // See the next test for confirmation heartbeats actually help.
     val script = Script.exactly(
-      reply("hello there world", streamFault = streamFault(delayBeforeFirstEvent = delay))
+      reply("hello there world", streamFault = streamFault(delayBeforeFirstEvent = delay, heartbeatInterval = Duration.Zero))
     )
 
-    val requestBody = """{"model":"gpt-4o-mini","stream":true,"messages":[{"role":"user","content":"hi"}]}"""
-
-    // Blocking, hand-rolled HTTP/1.1 -- deliberately not using any
-    // http4s or java.net.http client, all of which manage connection
-    // lifecycle themselves in ways that could mask what a genuinely
-    // abandoned connection looks like. Reads only the status line and
-    // headers (stops at the blank line separator), then closes --
-    // never touches the body, which is exactly the scenario in
-    // question.
-    def probeAndDisconnect(port: Int): IO[Unit] = IO.blocking {
-      val socket = new java.net.Socket("127.0.0.1", port)
-      try {
-        socket.setSoTimeout(5000)
-        val bodyBytes = requestBody.getBytes("UTF-8")
-        val request =
-          "POST /v1/chat/completions HTTP/1.1\r\n" +
-            s"Host: 127.0.0.1:$port\r\n" +
-            "Content-Type: application/json\r\n" +
-            s"Content-Length: ${bodyBytes.length}\r\n" +
-            "Connection: close\r\n\r\n"
-        val out = socket.getOutputStream
-        out.write(request.getBytes("UTF-8"))
-        out.write(bodyBytes)
-        out.flush()
-
-        val in = new java.io.BufferedReader(new java.io.InputStreamReader(socket.getInputStream, "UTF-8"))
-        var line = in.readLine()
-        // Status line, then headers until the blank-line separator --
-        // never reads into the body.
-        while (line != null && line.nonEmpty) {
-          line = in.readLine()
-        }
-      } finally {
-        socket.close() // the actual disconnect this test is about
-      }
-    }
-
-    def queryJournal(httpApp: HttpApp[IO]): IO[List[CapturedCall]] =
-      httpApp.run(Request[IO](Method.GET, uri"/_llmsim/calls")).flatMap(_.as[List[CapturedCall]])
-
-    val program =
+    val program = bootServerAndProbe(script) { (httpApp, server) =>
       for {
-        httpApp <- App.build(script)
-        result  <- EmberServerBuilder
-                     .default[IO]
-                     .withHost(host"127.0.0.1")
-                     .withPort(port"0")
-                     .withHttpApp(httpApp)
-                     .build
-                     .use { server =>
-                       for {
-                         _            <- probeAndDisconnect(server.address.getPort)
-                         _            <- IO.sleep(2.seconds)
-                         // Confirmed absent at 2s -- see the comment
-                         // above. This is the documented gap, not a
-                         // flaky assertion.
-                         promptCalls  <- queryJournal(httpApp)
-                         _            <- IO.sleep(delay - 2.seconds + 500.millis)
-                         // But it DOES eventually complete once the
-                         // scripted delay naturally runs out -- the
-                         // mechanism isn't stuck forever, just not
-                         // responsive to the disconnect itself.
-                         eventualCalls <- queryJournal(httpApp)
-                       } yield (promptCalls, eventualCalls)
-                     }
-      } yield result
+        _             <- probeAndDisconnect(server.address.getPort)
+        _             <- IO.sleep(2.seconds)
+        // Confirmed absent at 2s -- see the comment above. This is the
+        // documented gap, not a flaky assertion.
+        promptCalls   <- queryJournal(httpApp)
+        _             <- IO.sleep(delay - 2.seconds + 500.millis)
+        // But it DOES eventually complete once the scripted delay
+        // naturally runs out -- the mechanism isn't stuck forever,
+        // just not responsive to the disconnect itself.
+        eventualCalls <- queryJournal(httpApp)
+      } yield (promptCalls, eventualCalls)
+    }
 
     program.map { case (promptCalls, eventualCalls) =>
       promptCalls shouldBe empty
@@ -192,6 +195,56 @@ class DisconnectSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
       // for the classification decision (Cancelled vs Failed) the
       // design note flagged as a separate question from this one.
       info(s"eventual outcome: ${eventualCalls.head.outcome}")
+    }
+  }
+
+  // -----------------------------------------------------------------
+  // Test 3: confirms the actual fix. Same disconnect scenario as test
+  // 2, but with heartbeatInterval left active -- proving a long
+  // delay's disconnect-discovery latency is now BOUNDED, not the full
+  // delay. This is the point of the whole feature: it doesn't make
+  // disconnect detection instant (nothing can, per the confirmed
+  // TCP/HTTP-1.1 finding -- see StreamFault's doc comment), it bounds
+  // how long discovery can possibly take.
+  //
+  // Polls repeatedly rather than sleeping once and checking -- a
+  // single fixed wait turned out to be fragile. TCP-level detection of
+  // a dead peer commonly needs more than one write attempt to surface:
+  // the first write into an already-open send path can go unnoticed,
+  // with the actual failure only appearing on a LATER write, once an
+  // RST has actually made it back. Polling is robust to that
+  // uncertainty regardless of how many attempts it actually takes, and
+  // reports the real number back via info(...) -- genuinely useful
+  // data point for whether the 15s production default is a tight
+  // enough bound in practice, not just a guess.
+  // -----------------------------------------------------------------
+
+  "a heartbeat during a long delay bounds disconnect-detection latency, unlike test 2's disabled case" in {
+    val heartbeatInterval = 1.second
+    val longDelay          = 15.seconds
+    val maxAttempts         = 8 // 8s ceiling, comfortably under the 15s delay
+    val script = Script.exactly(
+      reply("hello there world", streamFault = streamFault(delayBeforeFirstEvent = longDelay, heartbeatInterval = heartbeatInterval))
+    )
+
+    def pollUntilPresent(httpApp: HttpApp[IO], attempt: Int): IO[(Int, List[CapturedCall])] =
+      for {
+        _     <- IO.sleep(heartbeatInterval)
+        calls <- queryJournal(httpApp)
+        result <- if (calls.nonEmpty || attempt >= maxAttempts) IO.pure((attempt, calls))
+                  else pollUntilPresent(httpApp, attempt + 1)
+      } yield result
+
+    val program = bootServerAndProbe(script) { (httpApp, server) =>
+      for {
+        _      <- probeAndDisconnect(server.address.getPort)
+        result <- pollUntilPresent(httpApp, attempt = 1)
+      } yield result
+    }
+
+    program.map { case (attempts, calls) =>
+      calls should have size 1
+      info(s"detected after $attempts heartbeat interval(s) (~${attempts}s of ${longDelay.toSeconds}s), outcome: ${calls.head.outcome}")
     }
   }
 }
