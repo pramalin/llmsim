@@ -953,7 +953,7 @@ push ran anything.
     - ~~An omitted completion event, malformed SSE event~~ — done: `StreamFault(omitCompletionEvent, malformedEventAt)`, same as the delay fields — see "Streaming fault injection" above.
     - ~~Tool-call arguments split across chunks~~ — done: `StreamFault(splitToolCallArguments)` — see "Streaming fault injection" above. Every planned fault type from this item is now built.
     - ~~HTTP 429 before streaming begins~~ — done: needed no new mechanism at all, confirmed by test rather than assumed — `Step.Error` was already matched identically regardless of `stream: true`, so this was purely a wire-level test confirming a 429 (or any error) is always a plain JSON body, never SSE, matching every real vendor's actual behavior.
-    - `ci/spring-verification` extensions for disconnect and split-arguments.
+    - ~~`ci/spring-verification` extensions for disconnect and split-arguments~~ — done: `VerificationFlow` gained two steps (11: split tool-call arguments, 12: an abandoned stream), consumed by two new tests confirming Spring AI's real client handles both correctly. The disconnect test specifically checks something llmsim's own DisconnectSpec.scala (a raw socket) couldn't: whether Spring AI's real client (Reactor Netty) actually closes its connection when a subscriber gives up, or whether connection pooling masks that. Item 14 is now complete.
 15. `GET /v1/models`.
 16. The real Angular console (`console-angular/`), served by the standalone image at `/_llmsim/ui`, with overview/calls/timeline/streaming views as designed. Deliberately last — the data model (streams, faults) needs to be settled first so the UI is built once against a stable shape instead of reworked mid-flight.
 
