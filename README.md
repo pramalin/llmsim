@@ -475,6 +475,64 @@ concept to learn. What's left for item 14 is validating a couple of
 these (disconnect, split arguments) against a real Spring AI client in
 `ci/spring-verification`, not further llmsim-side work.
 
+## Listing available models
+
+```bash
+curl -s http://localhost:8089/v1/models
+```
+
+Real OpenAI and Anthropic clients sometimes call `GET /v1/models` before
+ever making a chat request — a connectivity check, a "list models"
+button, occasionally a framework's own startup validation. Without this,
+anything that does so would 404 against llmsim even though the actual
+chat traffic works fine.
+
+Static and unscripted, unlike everything else llmsim answers: listing
+available models isn't part of a conversation, so this doesn't consume
+a script step or touch the journal at all, regardless of how many times
+it's called or what the current script's position is.
+
+**The one genuinely interesting design choice here:** unlike
+`/v1/chat/completions` vs `/v1/messages`, this is the *same path* on
+both real vendors' APIs — llmsim can't tell OpenAI's and Anthropic's
+official SDKs apart by URL alone the way it does everywhere else. The
+Anthropic SDK always sends an `anthropic-version` header (required on
+every real Anthropic API call); the OpenAI SDK never does. llmsim uses
+that header's presence to decide which response shape to send back —
+the one place in this project a header decides routing instead of a
+path.
+
+```json
+{
+  "object": "list",
+  "data": [
+    { "id": "gpt-4o-mini", "object": "model", "created": 1721692800, "owned_by": "openai" },
+    { "id": "gpt-4o", "object": "model", "created": 1715558400, "owned_by": "openai" }
+  ]
+}
+```
+
+```bash
+curl -s http://localhost:8089/v1/models -H "anthropic-version: 2023-06-01"
+```
+
+```json
+{
+  "data": [
+    { "id": "claude-sonnet-5", "type": "model", "display_name": "Claude Sonnet 5", "created_at": "2026-01-01T00:00:00Z" },
+    { "id": "claude-haiku-4-5", "type": "model", "display_name": "Claude Haiku 4.5", "created_at": "2025-10-01T00:00:00Z" }
+  ],
+  "has_more": false
+}
+```
+
+A minimal, accurate subset of each real shape, not the full catalog a
+live deployment would return — Anthropic's real response in particular
+carries a large, fast-evolving `capabilities` object per model plus
+cursor-based pagination, neither of which is load-bearing for what this
+endpoint exists to unblock. Model list is fixed and not currently
+scriptable.
+
 ## Inspecting captured calls
 
 Every call the simulator receives is recorded — provider, a normalized
@@ -954,7 +1012,7 @@ push ran anything.
     - ~~Tool-call arguments split across chunks~~ — done: `StreamFault(splitToolCallArguments)` — see "Streaming fault injection" above. Every planned fault type from this item is now built.
     - ~~HTTP 429 before streaming begins~~ — done: needed no new mechanism at all, confirmed by test rather than assumed — `Step.Error` was already matched identically regardless of `stream: true`, so this was purely a wire-level test confirming a 429 (or any error) is always a plain JSON body, never SSE, matching every real vendor's actual behavior.
     - ~~`ci/spring-verification` extensions for disconnect and split-arguments~~ — done: `VerificationFlow` gained two steps (11: split tool-call arguments, 12: an abandoned stream), consumed by two new tests confirming Spring AI's real client handles both correctly. The disconnect test specifically checks something llmsim's own DisconnectSpec.scala (a raw socket) couldn't: whether Spring AI's real client (Reactor Netty) actually closes its connection when a subscriber gives up, or whether connection pooling masks that. Item 14 is now complete.
-15. `GET /v1/models`.
+15. ~~`GET /v1/models`~~ — done: a static, unscripted endpoint (see "Listing available models" above) that exists purely so a client's own connectivity checks or startup validation don't 404 against llmsim, disambiguated between OpenAI's and Anthropic's shapes by the `anthropic-version` header rather than by path, since this is the one endpoint that's identical on both real vendors' APIs.
 16. The real Angular console (`console-angular/`), served by the standalone image at `/_llmsim/ui`, with overview/calls/timeline/streaming views as designed. Deliberately last — the data model (streams, faults) needs to be settled first so the UI is built once against a stable shape instead of reworked mid-flight.
 
 `agentic-analytics` remains a pure downstream consumer throughout all of the above — it always pins a released `llmsim-build` tag (never a dev build), the same as any other project building on llmsim.
