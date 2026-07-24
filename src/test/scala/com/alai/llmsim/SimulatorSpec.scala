@@ -691,6 +691,94 @@ class SimulatorSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers {
     }
   }
 
+  "streaming fault injection: frame content" - {
+
+    "StreamFault rejects a negative malformedEventAt at construction" in {
+      assertThrows[IllegalArgumentException] {
+        StreamFault(malformedEventAt = Some(-1))
+      }
+    }
+
+    "omitCompletionEvent drops the [DONE] literal but keeps every other frame, against OpenAI" in {
+      for {
+        c        <- clientFor(Script.exactly(
+                      reply("hi", streamFault = streamFault(omitCompletionEvent = true))
+                    ))
+        response <- c.expect[String](openAIStreamingRequest())
+      } yield {
+        val frames = parseFrames(response)
+        // "hi" -> role chunk, one content chunk, final chunk -- no
+        // [DONE] this time, since that's exactly what's omitted.
+        frames.size shouldBe 3
+        frames.map(_._2) should not contain "[DONE]"
+        frames.forall(f => parseJson(f._2).isRight) shouldBe true
+      }
+    }
+
+    "omitCompletionEvent drops message_stop but keeps every other event, against Anthropic" in {
+      for {
+        c        <- clientFor(Script.exactly(
+                      reply("hi", streamFault = streamFault(omitCompletionEvent = true))
+                    ))
+        response <- c.expect[String](anthropicStreamingRequest())
+      } yield {
+        val frames = parseFrames(response)
+        // message_start, content_block_start, content_block_delta,
+        // content_block_stop, message_delta -- message_stop is what's
+        // omitted, everything before it is untouched.
+        frames.size shouldBe 5
+        frames.map(_._1) should not contain Some("message_stop")
+      }
+    }
+
+    "malformedEventAt replaces exactly one frame with invalid JSON, every other frame is untouched, against OpenAI" in {
+      for {
+        c        <- clientFor(Script.exactly(
+                      reply("hello world", streamFault = streamFault(malformedEventAt = Some(1)))
+                    ))
+        response <- c.expect[String](openAIStreamingRequest())
+      } yield {
+        val frames = parseFrames(response).map(_._2)
+        // role(0), "hello"(1), "world"(2), final(3), [DONE](4)
+        frames.size shouldBe 5
+        frames(1) shouldBe "{this is deliberately not valid json}"
+        parseJson(frames(1)).isLeft shouldBe true
+        List(0, 2, 3).foreach(i => parseJson(frames(i)).isRight shouldBe true)
+        frames(4) shouldBe "[DONE]"
+      }
+    }
+
+    "malformedEventAt replaces exactly one frame with invalid JSON, against Anthropic" in {
+      for {
+        c        <- clientFor(Script.exactly(
+                      reply("hello world", streamFault = streamFault(malformedEventAt = Some(2)))
+                    ))
+        response <- c.expect[String](anthropicStreamingRequest())
+      } yield {
+        val frames = parseFrames(response).map(_._2)
+        // message_start(0), content_block_start(1), delta "hello"(2),
+        // delta " world"(3), content_block_stop(4), message_delta(5),
+        // message_stop(6)
+        frames.size shouldBe 7
+        frames(2) shouldBe "{this is deliberately not valid json}"
+        parseJson(frames(2)).isLeft shouldBe true
+        List(0, 1, 3, 4, 5, 6).foreach(i => parseJson(frames(i)).isRight shouldBe true)
+      }
+    }
+
+    "malformedEventAt past the actual frame count has no effect" in {
+      for {
+        c        <- clientFor(Script.exactly(
+                      reply("hi", streamFault = streamFault(malformedEventAt = Some(999)))
+                    ))
+        response <- c.expect[String](openAIStreamingRequest())
+      } yield {
+        val frames = parseFrames(response).map(_._2)
+        frames.forall(f => f == "[DONE]" || parseJson(f).isRight) shouldBe true
+      }
+    }
+  }
+
   "streaming fault injection: errors never stream" - {
 
     // No new mechanism needed for this -- Step.Error is matched

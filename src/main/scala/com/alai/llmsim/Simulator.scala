@@ -204,7 +204,7 @@ object Simulator {
 
                                          val renderedFrames = (roleChunk :: contentChunks ::: List(finalChunk))
                                            .map(j => sseFrame(None, j)) :+ "data: [DONE]\n\n"
-                                         val frames = paced(renderedFrames, streamFault)
+                                         val frames = paced(applyFrameFaults(renderedFrames, streamFault), streamFault)
 
                                          // Same aggregate response shape a non-streaming call would have
                                          // logged -- only `streamed` distinguishes transport in the journal.
@@ -257,7 +257,7 @@ object Simulator {
 
                                          val renderedFrames = List(roleChunk, toolChunk, finalChunk)
                                            .map(j => sseFrame(None, j)) :+ "data: [DONE]\n\n"
-                                         val frames = paced(renderedFrames, streamFault)
+                                         val frames = paced(applyFrameFaults(renderedFrames, streamFault), streamFault)
 
                                          val aggregate = OpenAI.ChatResponse(
                                            id = chatId, created = created, model = body.model,
@@ -326,7 +326,7 @@ object Simulator {
 
                                              val renderedFrames = (roleChunk :: contentChunks ::: List(finalChunk))
                                                .map(j => sseFrame(None, j)) :+ "data: [DONE]\n\n"
-                                             val frames = paced(renderedFrames, streamFault)
+                                             val frames = paced(applyFrameFaults(renderedFrames, streamFault), streamFault)
 
                                              val aggregate = OpenAI.ChatResponse(
                                                id = chatId, created = created, model = body.model,
@@ -429,7 +429,7 @@ object Simulator {
                                              List(("content_block_stop", blockStop), ("message_delta", messageDelta), ("message_stop", messageStop))
 
                                          val renderedFrames = events.map { case (ev, j) => sseFrame(Some(ev), j) }
-                                         val frames = paced(renderedFrames, streamFault)
+                                         val frames = paced(applyFrameFaults(renderedFrames, streamFault), streamFault)
 
                                          val aggregate = Anthropic.MessagesResponse(
                                            id = msgId, content = List(Anthropic.ContentBlock(`type` = "text", text = Some(text))),
@@ -502,7 +502,7 @@ object Simulator {
                                                ("message_delta", messageDelta), ("message_stop", messageStop)
                                              )
                                              val renderedFrames = events.map { case (ev, j) => sseFrame(Some(ev), j) }
-                                             val frames = paced(renderedFrames, streamFault)
+                                             val frames = paced(applyFrameFaults(renderedFrames, streamFault), streamFault)
 
                                              val aggregate = Anthropic.MessagesResponse(
                                                id = msgId,
@@ -574,7 +574,7 @@ object Simulator {
                                                  List(("content_block_stop", blockStop), ("message_delta", messageDelta), ("message_stop", messageStop))
 
                                              val renderedFrames = events.map { case (ev, j) => sseFrame(Some(ev), j) }
-                                             val frames = paced(renderedFrames, streamFault)
+                                             val frames = paced(applyFrameFaults(renderedFrames, streamFault), streamFault)
 
                                              val aggregate = Anthropic.MessagesResponse(
                                                id = msgId, content = List(Anthropic.ContentBlock(`type` = "text", text = Some(text))),
@@ -830,6 +830,29 @@ object Simulator {
       val delayed = delay.map(d => pacedDelay(d, heartbeatInterval)).getOrElse(Stream.empty: Stream[IO, String])
       acc ++ delayed ++ Stream.emit(frame)
     }
+  }
+
+  // Mutates WHICH frames get sent, as opposed to paced()'s WHEN --
+  // deliberately kept separate and applied first, so paced() always
+  // works on the frame list that's actually going out, faults and
+  // all, rather than needing to know about content mutation itself.
+  //
+  // Order matters when both fields are set on the same step:
+  // malformedEventAt is applied against the ORIGINAL frame indices
+  // first, then omitCompletionEvent drops the (possibly now-mutated)
+  // last element. Corrupting the completion frame and then also
+  // omitting it is an odd combination to configure deliberately, but
+  // the result is still deterministic either way, which is what
+  // actually matters here.
+  private val MalformedFrame = "data: {this is deliberately not valid json}\n\n"
+
+  private def applyFrameFaults(frames: List[String], fault: Option[StreamFault]): List[String] = {
+    val afterMalformed = fault.flatMap(_.malformedEventAt) match {
+      case Some(i) if frames.isDefinedAt(i) => frames.updated(i, MalformedFrame)
+      case _                                 => frames
+    }
+    if (fault.exists(_.omitCompletionEvent) && afterMalformed.nonEmpty) afterMalformed.init
+    else afterMalformed
   }
 
   // A script-provided UsageOverride is used verbatim when present -- for

@@ -16,15 +16,14 @@ final case class UsageOverride(promptTokens: Int, completionTokens: Int) {
   require(completionTokens >= 0, s"completionTokens must be >= 0, got $completionTokens")
 }
 
-/** Artificial timing a script can attach to a streamed response --
-  * ignored entirely for a non-streaming call to the same step, since
-  * these are transport-level effects with nothing meaningful to mean
-  * outside SSE. "Fault" is the umbrella name for roadmap item 14 as a
-  * whole (disconnect, malformed events, an omitted completion event,
-  * and split tool-call arguments are the same case class's later
-  * fields, not new types) -- adding fields here as each one lands
-  * keeps every existing script, which never mentions StreamFault at
-  * all, compiling unchanged throughout. The delay fields specifically
+/** Artificial timing and content faults a script can attach to a
+  * streamed response -- ignored entirely for a non-streaming call to
+  * the same step, since these are transport-level effects with
+  * nothing meaningful to mean outside SSE. "Fault" is the umbrella
+  * name for roadmap item 14 as a whole (split tool-call arguments is
+  * this case class's next field, not a new type) -- adding fields
+  * here as each one lands keeps every existing script, which never
+  * mentions StreamFault at all, compiling unchanged throughout. The delay fields specifically
   * aren't inherently "faulty," though: a real model can legitimately
   * be slow to start or slow to keep generating, and these two fields
   * exist to represent that as much as any deliberately broken
@@ -74,11 +73,32 @@ final case class UsageOverride(promptTokens: Int, completionTokens: Int) {
 final case class StreamFault(
     delayBeforeFirstEvent: FiniteDuration = Duration.Zero,
     delayBetweenEvents: FiniteDuration = Duration.Zero,
-    heartbeatInterval: FiniteDuration = 15.seconds
+    heartbeatInterval: FiniteDuration = 15.seconds,
+    // Drops just the terminal "stream is done" signal -- OpenAI's
+    // literal "data: [DONE]\n\n", Anthropic's message_stop -- while
+    // every other frame still sends normally. A model that produces
+    // real content but never formally signals completion, testing
+    // whether a client hangs waiting for an end that never comes
+    // rather than a parse or connection failure.
+    omitCompletionEvent: Boolean = false,
+    // 0-based index into the frame list (role/message_start is index
+    // 0), replacing that one frame's data payload with syntactically
+    // INVALID JSON -- not a wrong shape, a genuine parse failure, the
+    // most common real-world "malformed event" case (a truncated or
+    // garbled payload from a flaky upstream). Silently has no effect
+    // if the index is past the actual frame count for that reply's
+    // text -- frame count depends on word-count chunking the script
+    // author doesn't directly control, so an out-of-range index is
+    // usually a sign the reply text changed, not something worth
+    // failing loudly over. A negative index IS rejected at
+    // construction, same as the durations above -- that's
+    // unambiguously a script bug, not a framing mismatch.
+    malformedEventAt: Option[Int] = None
 ) {
   require(delayBeforeFirstEvent >= Duration.Zero, s"delayBeforeFirstEvent must be >= 0, got $delayBeforeFirstEvent")
   require(delayBetweenEvents >= Duration.Zero, s"delayBetweenEvents must be >= 0, got $delayBetweenEvents")
   require(heartbeatInterval >= Duration.Zero, s"heartbeatInterval must be >= 0, got $heartbeatInterval")
+  malformedEventAt.foreach(i => require(i >= 0, s"malformedEventAt must be >= 0, got $i"))
 }
 
 /** A single call gets answered by one Step.
@@ -195,9 +215,11 @@ object Script {
   def streamFault(
       delayBeforeFirstEvent: FiniteDuration = Duration.Zero,
       delayBetweenEvents: FiniteDuration = Duration.Zero,
-      heartbeatInterval: FiniteDuration = 15.seconds
+      heartbeatInterval: FiniteDuration = 15.seconds,
+      omitCompletionEvent: Boolean = false,
+      malformedEventAt: Option[Int] = None
   ): Option[StreamFault] =
-    Some(StreamFault(delayBeforeFirstEvent, delayBetweenEvents, heartbeatInterval))
+    Some(StreamFault(delayBeforeFirstEvent, delayBetweenEvents, heartbeatInterval, omitCompletionEvent, malformedEventAt))
 }
 
 /** Every startup script is a Scala object implementing this trait. Main
