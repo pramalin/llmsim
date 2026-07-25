@@ -47,17 +47,35 @@ object Main extends TyrianIOApp[Msg, Model]:
   def init(flags: Map[String, String]): (Model, Cmd[IO, Msg]) =
     (
       Model(calls = Nil, error = None, loading = true, dashboard = None, dashboardError = None,
-        selectedSequence = None, actionState = ActionState.Idle,
+        selectedSequence = None, actionState = ActionState.Idle, refreshing = false, lastRefreshedAt = None,
         providerFilter = None, outcomeFilter = None, streamedOnly = false, modelSearch = ""),
       Cmd.Batch(List(fetchCalls, fetchDashboard))
     )
 
   def update(model: Model): Msg => (Model, Cmd[IO, Msg]) =
-    case Msg.CallsLoaded(calls) => (model.copy(calls = calls, error = None, loading = false), Cmd.None)
-    case Msg.FetchError(err)    => (model.copy(error = Some(err), loading = false), Cmd.None)
-    case Msg.DashboardLoaded(summary) => (model.copy(dashboard = Some(summary), dashboardError = None), Cmd.None)
-    case Msg.DashboardFetchError(err) => (model.copy(dashboardError = Some(err)), Cmd.None)
+    // error/dashboardError are NEVER cleared on failure now, deliberately
+    // -- the views (contentView, scriptStatusView, summaryStripView)
+    // check "do we have data" first and render it regardless, showing
+    // these only as a warning banner over existing data, or as a full
+    // error state when there's genuinely nothing else to show yet
+    // (the very first load). That's the actual fix for "retain the
+    // previous journal when a refresh fails" -- clearing error only
+    // ever happens on a NEW success, not as part of showing one.
+    case Msg.CallsLoaded(calls) =>
+      (model.copy(calls = calls, error = None, loading = false, refreshing = false, lastRefreshedAt = Some(nowText)), Cmd.None)
+    case Msg.FetchError(err) =>
+      (model.copy(error = Some(err), loading = false, refreshing = false), Cmd.None)
+    case Msg.DashboardLoaded(summary) =>
+      (model.copy(dashboard = Some(summary), dashboardError = None, refreshing = false, lastRefreshedAt = Some(nowText)), Cmd.None)
+    case Msg.DashboardFetchError(err) =>
+      (model.copy(dashboardError = Some(err), refreshing = false), Cmd.None)
     case Msg.SelectCall(seq)    => (model.copy(selectedSequence = Some(seq)), Cmd.None)
+    case Msg.RefreshClicked =>
+      // Not destructive like Reset/Clear, so no ActionState needed --
+      // just a plain guard against a redundant fetch if one's already
+      // in flight.
+      if model.refreshing then (model, Cmd.None)
+      else (model.copy(refreshing = true), Cmd.Batch(List(fetchCalls, fetchDashboard)))
     case Msg.ResetClicked =>
       model.actionState match
         // The real safety net against double-clicks: ignored outright
@@ -108,36 +126,49 @@ object Main extends TyrianIOApp[Msg, Model]:
     Sub.None
 
   private def scriptStatusView(model: Model): Html[Msg] =
-    model.dashboardError match
-      case Some(err) => div(`class` := "status-message status-message-error")(s"Script status unavailable: $err")
+    model.dashboard match
       case None =>
-        model.dashboard match
-          case None => div(`class` := "status-message")("Script: loading...")
-          case Some(d) =>
-            val (badgeClass, badgeText) =
-              if d.script.exhausted then ("status-badge status-badge-exhausted", "Exhausted")
-              else ("status-badge status-badge-running", "Running")
-            val progressText =
-              if d.script.exhausted then
-                s"The script is exhausted -- the next request will fail" +
-                  s" (configured overrun behavior: ${d.script.onOverrun})."
-              else
-                // nextStepIndex is 0-based internally; +1 for a
-                // human-countable "Next response: 1 of N", clearer
-                // than the previous "Step 0 of N" (ambiguous -- has
-                // step 0 already happened, or is it next?).
-                s"Next response: ${d.script.nextStepIndex.map(_ + 1).getOrElse("-")} of ${d.script.totalSteps}" +
-                  s" (on overrun: ${d.script.onOverrun})"
-            // Laid out as a row via flexbox on the parent (.script-status
-            // in the stylesheet), not inline-block on each child --
-            // avoids needing an unconfirmed <span> tag just to get
-            // horizontal layout; div + CSS flex achieves the same thing
-            // using only the already-confirmed div/class pattern.
-            div(`class` := "script-status")(
-              div(`class` := badgeClass)(badgeText),
-              div(s"Script: ${d.script.name.getOrElse("-")}"),
-              div(progressText)
-            )
+        // Nothing to show yet at all -- this is the only case where an
+        // error genuinely replaces the whole view, since there's no
+        // stale data underneath it to preserve.
+        model.dashboardError match
+          case Some(err) => div(`class` := "status-message status-message-error")(s"Script status unavailable: $err")
+          case None      => div(`class` := "status-message")("Script: loading...")
+      case Some(d) =>
+        val (badgeClass, badgeText) =
+          if d.script.exhausted then ("status-badge status-badge-exhausted", "Exhausted")
+          else ("status-badge status-badge-running", "Running")
+        val progressText =
+          if d.script.exhausted then
+            s"The script is exhausted -- the next request will fail" +
+              s" (configured overrun behavior: ${d.script.onOverrun})."
+          else
+            // nextStepIndex is 0-based internally; +1 for a
+            // human-countable "Next response: 1 of N", clearer
+            // than the previous "Step 0 of N" (ambiguous -- has
+            // step 0 already happened, or is it next?).
+            s"Next response: ${d.script.nextStepIndex.map(_ + 1).getOrElse("-")} of ${d.script.totalSteps}" +
+              s" (on overrun: ${d.script.onOverrun})"
+        // Laid out as a row via flexbox on the parent (.script-status
+        // in the stylesheet), not inline-block on each child --
+        // avoids needing an unconfirmed <span> tag just to get
+        // horizontal layout; div + CSS flex achieves the same thing
+        // using only the already-confirmed div/class pattern.
+        div()(
+          // We already have data (possibly from a while ago) -- a
+          // failed refresh becomes a warning banner on top of it,
+          // not a replacement for it. This is the actual fix for
+          // "retain the previous journal when a refresh fails".
+          (model.dashboardError match
+            case Some(err) => div(`class` := "stale-warning")(s"Could not refresh script status: $err")
+            case None      => div()
+          ),
+          div(`class` := "script-status")(
+            div(`class` := badgeClass)(badgeText),
+            div(s"Script: ${d.script.name.getOrElse("-")}"),
+            div(progressText)
+          )
+        )
 
   // "47 calls · 3 failures · 12 streamed · OpenAI 31 / Anthropic 16 ·
   // p95 420 ms" -- makes the console read as a deterministic test-
@@ -217,6 +248,17 @@ object Main extends TyrianIOApp[Msg, Model]:
       else button(onClick(Msg.ResetClicked))("Reset script + clear calls"),
       if isPending then button(onClick(Msg.ClearClicked), disabled)("Clear calls only")
       else button(onClick(Msg.ClearClicked))("Clear calls only"),
+      // Refresh is deliberately not part of ActionState -- it isn't
+      // destructive the way Reset/Clear are, just a plain guard in
+      // update against a redundant fetch already covers the double-
+      // click case without needing the full Pending/Succeeded/Failed
+      // machinery.
+      if model.refreshing then button(onClick(Msg.RefreshClicked), disabled)("Refresh")
+      else button(onClick(Msg.RefreshClicked))("Refresh"),
+      (model.lastRefreshedAt match
+        case Some(t) => div(`class` := "last-refreshed")(s"Updated $t")
+        case None    => div()
+      ),
       model.actionState match
         case ActionState.Idle                  => div()
         case ActionState.Pending(Action.Reset)  => div(`class` := "action-status")("Resetting...")
@@ -227,28 +269,37 @@ object Main extends TyrianIOApp[Msg, Model]:
 
   private def contentView(model: Model): Html[Msg] =
     if model.loading then div(`class` := "status-message")("Loading calls...")
-    else
+    else if model.calls.isEmpty then
+      // Nothing to show yet at all -- this is the only case where an
+      // error genuinely replaces the whole view, since there's no
+      // stale data underneath it to preserve.
       model.error match
         case Some(err) => div(`class` := "status-message status-message-error")(s"Fetch failed: $err")
         case None =>
-          if model.calls.isEmpty then
-            div(`class` := "status-message")(
-              "No calls recorded. Send a request to an OpenAI- or Anthropic-compatible endpoint to populate the journal."
-            )
-          else
-            val filtered = model.calls.filter(matchesFilters(_, model))
-            val selected = model.selectedSequence.flatMap(seq => filtered.find(_.sequence == seq))
-            // filtered.isEmpty is genuinely different from
-            // model.calls.isEmpty above -- "the journal has nothing"
-            // vs "the journal has data, the current filter just hides
-            // all of it" are different situations, and a reader
-            // switching filters needs to be able to tell them apart.
-            val tableOrEmptyNote: Html[Msg] =
-              if filtered.isEmpty then div(`class` := "status-message")("No calls match the current filters.")
-              else callsTable(filtered, model.selectedSequence)
-            val children: List[Html[Msg]] =
-              filterPanel(model) :: tableOrEmptyNote :: selected.map(detailView).toList
-            div()(children*)
+          div(`class` := "status-message")(
+            "No calls recorded. Send a request to an OpenAI- or Anthropic-compatible endpoint to populate the journal."
+          )
+    else
+      // We already have calls (possibly from a while ago) -- a failed
+      // refresh becomes a warning banner on top of the still-visible
+      // table, not a replacement for it. The actual fix for "retain
+      // the previous journal when a refresh fails".
+      val staleWarning: Html[Msg] = model.error match
+        case Some(err) => div(`class` := "stale-warning")(s"Could not refresh: $err -- showing last known data.")
+        case None      => div()
+      val filtered = model.calls.filter(matchesFilters(_, model))
+      val selected = model.selectedSequence.flatMap(seq => filtered.find(_.sequence == seq))
+      // filtered.isEmpty is genuinely different from
+      // model.calls.isEmpty above -- "the journal has nothing"
+      // vs "the journal has data, the current filter just hides
+      // all of it" are different situations, and a reader
+      // switching filters needs to be able to tell them apart.
+      val tableOrEmptyNote: Html[Msg] =
+        if filtered.isEmpty then div(`class` := "status-message")("No calls match the current filters.")
+        else callsTable(filtered, model.selectedSequence)
+      val children: List[Html[Msg]] =
+        staleWarning :: filterPanel(model) :: tableOrEmptyNote :: selected.map(detailView).toList
+      div()(children*)
 
   // Button-toggle filters, not <select> dropdowns -- select/option and
   // how their change events surface a value are genuinely unverified
@@ -409,6 +460,12 @@ object Main extends TyrianIOApp[Msg, Model]:
   private def formatEpochMillis(epochMillis: Long): String =
     new js.Date(epochMillis.toDouble).toLocaleString()
 
+  // new js.Date() with no arguments -- a documented, standard overload
+  // representing the current moment, same confirmed facade as
+  // formatEpochMillis above, just without an explicit millis value.
+  private def nowText: String =
+    new js.Date().toLocaleString()
+
   private def renderOutcomeDetail(outcome: CallOutcome): String = outcome match
     case CallOutcome.Responded(status, body)   => s"Responded ($status)\n${body.spaces2}"
     case CallOutcome.Rejected(status, message) => s"Rejected ($status): $message"
@@ -469,6 +526,14 @@ final case class Model(
     dashboardError: Option[String],
     selectedSequence: Option[Long],
     actionState: ActionState,
+    // True only while an explicit Refresh is in flight -- separate
+    // from `loading` (the very first fetch), so the UI can say
+    // "Refreshing..." rather than reusing the initial-load message.
+    refreshing: Boolean,
+    // Human-readable, set on any successful calls or dashboard fetch
+    // (whichever completes first) -- a plain timestamp of the last
+    // moment either side of the console's data was confirmed current.
+    lastRefreshedAt: Option[String],
     // None means "no filter" (show everything) for both -- not an
     // empty string or a sentinel value, so "not filtering" and
     // "filtering by nothing" can't be confused.
@@ -506,6 +571,7 @@ enum Msg:
   case DashboardFetchError(message: String)
   case SelectCall(sequence: Long)
   case ResetClicked
+  case RefreshClicked
   case ClearClicked
   case ActionSucceeded(message: String)
   case ActionFailed(message: String)
