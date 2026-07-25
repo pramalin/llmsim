@@ -8,6 +8,7 @@ import org.http4s.circe.CirceEntityCodec.*
 import org.http4s.dom.FetchClientBuilder
 import com.alai.llmsim.{CallOutcome, CapturedCall, DashboardSummary}
 
+import scala.scalajs.js
 import scala.scalajs.js.annotation.*
 
 // Same-origin relative paths (/_llmsim/calls, not
@@ -118,7 +119,8 @@ object Main extends TyrianIOApp[Msg, Model]:
               else ("status-badge status-badge-running", "Running")
             val progressText =
               if d.script.exhausted then
-                s"the next request will use the ${d.script.onOverrun} overrun behavior"
+                s"The script is exhausted -- the next request will fail" +
+                  s" (configured overrun behavior: ${d.script.onOverrun})."
               else
                 // nextStepIndex is 0-based internally; +1 for a
                 // human-countable "Next response: 1 of N", clearer
@@ -157,22 +159,38 @@ object Main extends TyrianIOApp[Msg, Model]:
           if d.journal.retainedCalls > 0 then
             f"${failures.toDouble / d.journal.retainedCalls * 100}%.0f%% of calls"
           else "-"
+        // Real bug caught in review: this card's subtitle used to
+        // show the all-calls provider breakdown, which reads as a
+        // breakdown of the streamed number right above it -- it
+        // wasn't. Percentage-of-calls now, matching Failures' own
+        // pattern; the actual provider breakdown moved to its own
+        // card below instead of being lost.
+        val streamedSub =
+          if d.journal.retainedCalls > 0 then
+            f"${d.calls.streamed.toDouble / d.journal.retainedCalls * 100}%.0f%% of calls"
+          else "-"
         val p95Text = d.latencyMillis.p95.map(p => s"${p}ms").getOrElse("-")
         val avgSub = d.latencyMillis.average.map(a => f"$a%.0fms avg").getOrElse("no data yet")
         div(`class` := "summary-cards")(
           summaryCard("Retained calls", d.journal.retainedCalls.toString, s"of ${d.journal.capacity} capacity"),
           summaryCard("Failures", failures.toString, failuresSub),
-          summaryCard("Streamed", d.calls.streamed.toString,
-            s"OpenAI ${d.calls.byProvider.getOrElse("openai", 0)} / Anthropic ${d.calls.byProvider.getOrElse("anthropic", 0)}"),
+          summaryCard("Streamed", d.calls.streamed.toString, streamedSub),
+          summaryCard("Providers",
+            s"OpenAI ${d.calls.byProvider.getOrElse("openai", 0)} · Anthropic ${d.calls.byProvider.getOrElse("anthropic", 0)}",
+            ""),
           summaryCard("Latency p95", p95Text, avgSub)
         )
 
   private def summaryCard(label: String, value: String, sub: String): Html[Msg] =
-    div(`class` := "summary-card")(
-      div(`class` := "summary-card-label")(label),
-      div(`class` := "summary-card-value")(value),
-      div(`class` := "summary-card-sub")(sub)
-    )
+    // Providers has no single headline number (it's a two-part
+    // breakdown), so value can be empty -- omit that line entirely
+    // rather than render an empty, oddly-large-font gap where a
+    // number would normally be.
+    val middle: List[Html[Msg]] =
+      if value.isEmpty then Nil else List(div(`class` := "summary-card-value")(value))
+    val children: List[Html[Msg]] =
+      div(`class` := "summary-card-label")(label) :: middle ::: List(div(`class` := "summary-card-sub")(sub))
+    div(`class` := "summary-card")(children*)
 
   private def controlPanel(model: Model): Html[Msg] =
     val isPending = model.actionState match
@@ -213,7 +231,10 @@ object Main extends TyrianIOApp[Msg, Model]:
       model.error match
         case Some(err) => div(`class` := "status-message status-message-error")(s"Fetch failed: $err")
         case None =>
-          if model.calls.isEmpty then div(`class` := "status-message")("No calls yet.")
+          if model.calls.isEmpty then
+            div(`class` := "status-message")(
+              "No calls recorded. Send a request to an OpenAI- or Anthropic-compatible endpoint to populate the journal."
+            )
           else
             val filtered = model.calls.filter(matchesFilters(_, model))
             val selected = model.selectedSequence.flatMap(seq => filtered.find(_.sequence == seq))
@@ -237,19 +258,25 @@ object Main extends TyrianIOApp[Msg, Model]:
   // pattern on top. Functionally equivalent; visual polish to match
   // the mockup's dropdowns is a separate, later styling pass.
   private def filterPanel(model: Model): Html[Msg] =
-    div()(
-      div("Provider:"),
+    div(`class` := "filter-panel")(
+      div(`class` := "filter-label")("Provider:"),
       filterToggle("All", model.providerFilter.isEmpty, Msg.SetProviderFilter(None)),
       filterToggle("OpenAI", model.providerFilter.contains("openai"), Msg.SetProviderFilter(Some("openai"))),
       filterToggle("Anthropic", model.providerFilter.contains("anthropic"), Msg.SetProviderFilter(Some("anthropic"))),
-      div("Outcome:"),
+      div(`class` := "filter-label")("Outcome:"),
       filterToggle("All", model.outcomeFilter.isEmpty, Msg.SetOutcomeFilter(None)),
       filterToggle("Responded", model.outcomeFilter.contains("responded"), Msg.SetOutcomeFilter(Some("responded"))),
       filterToggle("Rejected", model.outcomeFilter.contains("rejected"), Msg.SetOutcomeFilter(Some("rejected"))),
       filterToggle("Failed", model.outcomeFilter.contains("failed"), Msg.SetOutcomeFilter(Some("failed"))),
       filterToggle("Cancelled", model.outcomeFilter.contains("cancelled"), Msg.SetOutcomeFilter(Some("cancelled"))),
-      button(onClick(Msg.ToggleStreamedOnly))(
-        if model.streamedOnly then "Streamed only: On" else "Streamed only: Off"
+      // Unicode checkbox glyphs on the existing, confirmed button
+      // pattern, not a real <input type="checkbox"> -- that's another
+      // genuinely unverified Tyrian pattern (checked := ... behavior
+      // specifically), and this achieves the review's actual point
+      // (more recognizable than "On"/"Off" text) without introducing
+      // it.
+      button(onClick(Msg.ToggleStreamedOnly), `class` := "filter-toggle")(
+        if model.streamedOnly then "☑ Streamed calls only" else "☐ Streamed calls only"
       ),
       // onInput confirmed working from Tyrian's own http4s-dom
       // networking example (input(placeholder := "...", onInput(s =>
@@ -264,8 +291,8 @@ object Main extends TyrianIOApp[Msg, Model]:
     )
 
   private def filterToggle(label: String, active: Boolean, msg: Msg): Html[Msg] =
-    val activeStyle = if active then "font-weight: bold; text-decoration: underline;" else ""
-    button(onClick(msg), style := activeStyle)(label)
+    val activeClass = if active then "filter-toggle filter-toggle-active" else "filter-toggle"
+    button(onClick(msg), `class` := activeClass)(label)
 
   private def matchesFilters(call: CapturedCall, model: Model): Boolean =
     val providerOk = model.providerFilter.forall(_ == call.provider)
@@ -316,12 +343,23 @@ object Main extends TyrianIOApp[Msg, Model]:
       // button, so it doesn't look out of place next to the other
       // cells.
       td(button(onClick(Msg.SelectCall(call.sequence)), `class` := "seq-button")(call.sequence.toString)),
-      td(call.provider),
+      td(displayProvider(call.provider)),
       td(call.model.getOrElse("-")),
       td(`class` := outcomeClass(call.outcome))(renderOutcome(call.outcome)),
       td(if call.streamed then "yes" else "no"),
       td(call.durationMillis.toString)
     )
+
+  // "openai"/"anthropic" are the wire-level provider values (matching
+  // the lowercase discriminators used throughout DashboardSummary and
+  // the backend generally) -- proper display capitalization for the
+  // table specifically, not a wire-format change. Falls back to a
+  // simple first-letter capitalization for anything unrecognized,
+  // rather than assuming only these two providers will ever exist.
+  private def displayProvider(provider: String): String = provider match
+    case "openai"    => "OpenAI"
+    case "anthropic" => "Anthropic"
+    case other       => other.headOption.map(_.toUpper.toString).getOrElse("") + other.drop(1)
 
   private def outcomeClass(outcome: CallOutcome): String = outcome match
     case CallOutcome.Responded(_, _) => "outcome-responded"
@@ -346,11 +384,11 @@ object Main extends TyrianIOApp[Msg, Model]:
   private def detailView(call: CapturedCall): Html[Msg] =
     div()(
       h3(s"Call #${call.sequence}"),
-      div(s"Provider: ${call.provider}"),
+      div(s"Provider: ${displayProvider(call.provider)}"),
       div(s"Model: ${call.model.getOrElse("-")}"),
       div(s"Step index: ${call.stepIndex.map(_.toString).getOrElse("-")}"),
-      div(s"Received at (epoch ms): ${call.receivedAtEpochMillis}"),
-      div(s"Completed at (epoch ms): ${call.completedAtEpochMillis}"),
+      div(s"Received: ${formatEpochMillis(call.receivedAtEpochMillis)} (${call.receivedAtEpochMillis})"),
+      div(s"Completed: ${formatEpochMillis(call.completedAtEpochMillis)} (${call.completedAtEpochMillis})"),
       div(s"Duration: ${call.durationMillis}ms"),
       div(s"Streamed: ${call.streamed}"),
       h4("Messages"),
@@ -360,6 +398,16 @@ object Main extends TyrianIOApp[Msg, Model]:
       h4("Outcome"),
       pre(renderOutcomeDetail(call.outcome))
     )
+
+  // js.Date, not java.time -- standard Scala.js library facade over
+  // the browser's native Date, confirmed from Scala.js's own API docs
+  // before use (new Date(value: Double), .toLocaleString()) rather
+  // than assumed. Local time, not UTC, deliberately -- matches what
+  // someone actually reading this screen expects to see, with the
+  // exact epoch value kept alongside for anyone who needs the precise
+  // technical value.
+  private def formatEpochMillis(epochMillis: Long): String =
+    new js.Date(epochMillis.toDouble).toLocaleString()
 
   private def renderOutcomeDetail(outcome: CallOutcome): String = outcome match
     case CallOutcome.Responded(status, body)   => s"Responded ($status)\n${body.spaces2}"
