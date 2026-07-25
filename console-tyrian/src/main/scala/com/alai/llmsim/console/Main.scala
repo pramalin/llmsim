@@ -8,6 +8,7 @@ import org.http4s.circe.CirceEntityCodec.*
 import org.http4s.dom.FetchClientBuilder
 import com.alai.llmsim.{CallOutcome, CapturedCall, DashboardSummary}
 
+import scala.concurrent.duration._
 import scala.scalajs.js
 import scala.scalajs.js.annotation.*
 
@@ -122,6 +123,18 @@ object Main extends TyrianIOApp[Msg, Model]:
       div(`class` := "app-tagline")("Deterministic LLM API simulation and request inspection")
     )
 
+  // Auto-refresh deliberately not implemented -- Sub.every, which
+  // would provide exactly this, genuinely doesn't exist anywhere in
+  // tyrian.platform.Sub for this pinned Tyrian version (confirmed by
+  // reading tyrian-platform/src/tyrian/platform/Sub.scala directly
+  // from the actual current source, not inferred from an example that
+  // turned out to be from a different version). Building a custom
+  // timer from Sub.make + org.scalajs.dom's setInterval/clearInterval
+  // is possible in principle, but needs real, version-pinned
+  // verification of that facade's exact signature before attempting
+  // it again -- not done here after two failed guesses already.
+  // Manual Refresh (controlPanel) covers the actual requirement in
+  // the meantime.
   def subscriptions(model: Model): Sub[IO, Msg] =
     Sub.None
 
