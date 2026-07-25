@@ -7,7 +7,7 @@ import tyrian.classic.*
 import org.http4s.{Method, Request, Uri}
 import org.http4s.circe.CirceEntityCodec.*
 import org.http4s.dom.FetchClientBuilder
-import com.alai.llmsim.{CallOutcome, CapturedCall, CapturedHeader, DashboardSummary}
+import com.alai.llmsim.{CallOutcome, CapturedCall, DashboardSummary}
 
 import scala.concurrent.duration._
 import scala.scalajs.js
@@ -50,7 +50,7 @@ object Main extends TyrianIOApp[Msg, Model]:
     (
       Model(calls = Nil, error = None, loading = true, dashboard = None, dashboardError = None,
         selectedSequence = None, actionState = ActionState.Idle,
-        refreshPending = Set(RefreshPart.Calls, RefreshPart.Dashboard), lastRefreshedAt = None,
+        refreshPending = Set(RefreshPart.Calls, RefreshPart.Dashboard), refreshFailed = false, lastRefreshedAt = None,
         autoRefresh = false, selectedDetailTab = DetailTab.Summary,
         providerFilter = None, outcomeFilter = None, streamedOnly = false, modelSearch = ""),
       Cmd.Batch(List(fetchCalls, fetchDashboard))
@@ -66,16 +66,23 @@ object Main extends TyrianIOApp[Msg, Model]:
     case ActionState.Pending(_) => true
     case _                      => false
 
-  private def canRefreshNow(model: Model): Boolean =
+  // Used both to guard starting a refresh (manual or auto-tick) and to
+  // guard starting Reset/Clear -- the same underlying condition covers
+  // both directions of the race the review identified: a refresh
+  // shouldn't start while an action is in flight, and an action
+  // shouldn't start while a refresh is in flight, since response
+  // messages carry no per-cycle identifier and a delayed one from an
+  // earlier cycle could otherwise remove a part from a newer one.
+  private def noOperationInProgress(model: Model): Boolean =
     model.refreshPending.isEmpty && !actionInProgress(model)
 
   private def beginRefresh(model: Model): (Model, Cmd[IO, Msg]) =
-    (model.copy(refreshPending = Set(RefreshPart.Calls, RefreshPart.Dashboard)), Cmd.Batch(List(fetchCalls, fetchDashboard)))
+    (model.copy(refreshPending = Set(RefreshPart.Calls, RefreshPart.Dashboard), refreshFailed = false), Cmd.Batch(List(fetchCalls, fetchDashboard)))
 
   // Only sets lastRefreshedAt once refreshPending is genuinely empty --
   // both calls and dashboard resolved, not just whichever was faster.
   private def completeRefreshIfDone(model: Model): Model =
-    if model.refreshPending.isEmpty then model.copy(lastRefreshedAt = Some(nowText)) else model
+    if model.refreshPending.isEmpty && !model.refreshFailed then model.copy(lastRefreshedAt = Some(nowText)) else model
 
   def update(model: Model): Msg => (Model, Cmd[IO, Msg]) =
     // error/dashboardError are NEVER cleared on failure now, deliberately
@@ -90,44 +97,44 @@ object Main extends TyrianIOApp[Msg, Model]:
       (completeRefreshIfDone(model.copy(calls = calls, error = None, loading = false,
         refreshPending = model.refreshPending - RefreshPart.Calls)), Cmd.None)
     case Msg.FetchError(err) =>
-      (completeRefreshIfDone(model.copy(error = Some(err), loading = false,
+      (completeRefreshIfDone(model.copy(error = Some(err), loading = false, refreshFailed = true,
         refreshPending = model.refreshPending - RefreshPart.Calls)), Cmd.None)
     case Msg.DashboardLoaded(summary) =>
       (completeRefreshIfDone(model.copy(dashboard = Some(summary), dashboardError = None,
         refreshPending = model.refreshPending - RefreshPart.Dashboard)), Cmd.None)
     case Msg.DashboardFetchError(err) =>
-      (completeRefreshIfDone(model.copy(dashboardError = Some(err),
+      (completeRefreshIfDone(model.copy(dashboardError = Some(err), refreshFailed = true,
         refreshPending = model.refreshPending - RefreshPart.Dashboard)), Cmd.None)
     case Msg.SelectCall(seq)    => (model.copy(selectedSequence = Some(seq)), Cmd.None)
     case Msg.SelectDetailTab(tab) => (model.copy(selectedDetailTab = tab), Cmd.None)
     case Msg.RefreshClicked =>
-      if canRefreshNow(model) then beginRefresh(model) else (model, Cmd.None)
+      if noOperationInProgress(model) then beginRefresh(model) else (model, Cmd.None)
     case Msg.AutoRefreshTick =>
       // Same guard and same beginRefresh as a manual click -- ignoring
       // a tick that arrives while a refresh or a Reset/Clear is
       // already in flight, rather than suspending the subscription
       // itself, which would mean repeatedly stopping and restarting
       // the timer instead of just skipping a beat.
-      if canRefreshNow(model) then beginRefresh(model) else (model, Cmd.None)
+      if noOperationInProgress(model) then beginRefresh(model) else (model, Cmd.None)
     case Msg.ToggleAutoRefresh =>
       val turningOn = !model.autoRefresh
       val toggled = model.copy(autoRefresh = turningOn)
       // Enabling starts one refresh immediately rather than waiting
       // out the first full interval -- otherwise turning it on does
       // nothing visible for up to AutoRefreshInterval.
-      if turningOn && canRefreshNow(toggled) then beginRefresh(toggled) else (toggled, Cmd.None)
+      if turningOn && noOperationInProgress(toggled) then beginRefresh(toggled) else (toggled, Cmd.None)
     case Msg.ResetClicked =>
-      model.actionState match
-        // The real safety net against double-clicks: ignored outright
-        // while an action's already in flight, regardless of whether
-        // disabled := isPending (below, in controlPanel) actually
-        // works as expected -- that one's unverified, this isn't.
-        case ActionState.Pending(_) => (model, Cmd.None)
-        case _                      => (model.copy(actionState = ActionState.Pending(Action.Reset)), resetSimulator)
+      // noOperationInProgress covers both the original double-click
+      // guard (no action already pending) and the race the review
+      // caught: also refusing to start while a refresh is in flight,
+      // since a delayed response from that refresh could otherwise
+      // remove a part from the new cycle this action's own success
+      // handler starts.
+      if noOperationInProgress(model) then (model.copy(actionState = ActionState.Pending(Action.Reset)), resetSimulator)
+      else (model, Cmd.None)
     case Msg.ClearClicked =>
-      model.actionState match
-        case ActionState.Pending(_) => (model, Cmd.None)
-        case _                      => (model.copy(actionState = ActionState.Pending(Action.Clear)), clearCalls)
+      if noOperationInProgress(model) then (model.copy(actionState = ActionState.Pending(Action.Clear)), clearCalls)
+      else (model, Cmd.None)
     case Msg.ActionSucceeded(msg) =>
       // Re-fetch both after a successful reset/clear -- the journal
       // changed either way, but script position only changes for
@@ -276,9 +283,7 @@ object Main extends TyrianIOApp[Msg, Model]:
     div(`class` := "summary-card")(children*)
 
   private def controlPanel(model: Model): Html[Msg] =
-    val isPending = model.actionState match
-      case ActionState.Pending(_) => true
-      case _                      => false
+    val isPending = !noOperationInProgress(model)
     div(`class` := "control-panel")(
       // "Reset script + clear calls" / "Clear calls only" -- Reset and
       // Clear read as near-synonyms even though they do genuinely
@@ -634,11 +639,17 @@ final case class Model(
     // parts have resolved (success or failure), not whichever is
     // faster.
     refreshPending: Set[RefreshPart],
-    // Set only when refreshPending becomes empty (the full cycle
-    // finished), not whichever of calls/dashboard happens to resolve
-    // first -- same reasoning as refreshPending above: "Updated ..."
-    // showing a time while the other half was still in flight would
-    // imply everything was current when only one side actually was.
+    // True if either part of the CURRENT cycle failed -- reset to
+    // false at the start of every beginRefresh, set on either error.
+    // Real bug caught by review: lastRefreshedAt used to update
+    // whenever refreshPending became empty regardless of this, so a
+    // refresh where BOTH calls and dashboard failed could still show
+    // "Updated 2:45:10 PM" -- true only in the sense that a refresh
+    // attempt completed, not that any data was actually refreshed.
+    refreshFailed: Boolean,
+    // Set only when refreshPending becomes empty AND refreshFailed is
+    // false -- both parts resolved successfully, not just "the cycle
+    // finished" regardless of outcome.
     lastRefreshedAt: Option[String],
     autoRefresh: Boolean,
     // Global, not per-call -- deliberately. Switching to a different
