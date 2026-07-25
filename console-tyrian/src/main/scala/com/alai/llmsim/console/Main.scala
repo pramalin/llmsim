@@ -84,11 +84,23 @@ object Main extends TyrianIOApp[Msg, Model]:
     case Msg.NoOp                => (model, Cmd.None)
 
   def view(model: Model): Html[Msg] =
-    div()(
+    div(`class` := "app-container")(
+      headerView,
       scriptStatusView(model),
       summaryStripView(model),
       controlPanel(model),
       contentView(model)
+    )
+
+  // Always rendered, not tied to model state at all -- the actual fix
+  // for "the initial page load looks plain": before this, everything
+  // on screen depended on data that hadn't arrived yet, so the very
+  // first render was just bare "loading..." text with nothing else
+  // establishing what the page even is.
+  private def headerView: Html[Msg] =
+    div(`class` := "app-header")(
+      h1("llmsim console"),
+      div(`class` := "app-tagline")("Deterministic LLM API simulation and request inspection")
     )
 
   def subscriptions(model: Model): Sub[IO, Msg] =
@@ -96,14 +108,17 @@ object Main extends TyrianIOApp[Msg, Model]:
 
   private def scriptStatusView(model: Model): Html[Msg] =
     model.dashboardError match
-      case Some(err) => div(s"Script status unavailable: $err")
+      case Some(err) => div(`class` := "status-message status-message-error")(s"Script status unavailable: $err")
       case None =>
         model.dashboard match
-          case None => div("Script: loading...")
+          case None => div(`class` := "status-message")("Script: loading...")
           case Some(d) =>
+            val (badgeClass, badgeText) =
+              if d.script.exhausted then ("status-badge status-badge-exhausted", "Exhausted")
+              else ("status-badge status-badge-running", "Running")
             val progressText =
               if d.script.exhausted then
-                s"exhausted -- the next request will use the ${d.script.onOverrun} overrun behavior"
+                s"the next request will use the ${d.script.onOverrun} overrun behavior"
               else
                 // nextStepIndex is 0-based internally; +1 for a
                 // human-countable "Next response: 1 of N", clearer
@@ -111,7 +126,16 @@ object Main extends TyrianIOApp[Msg, Model]:
                 // step 0 already happened, or is it next?).
                 s"Next response: ${d.script.nextStepIndex.map(_ + 1).getOrElse("-")} of ${d.script.totalSteps}" +
                   s" (on overrun: ${d.script.onOverrun})"
-            div(s"Script: ${d.script.name.getOrElse("-")} -- $progressText")
+            // Laid out as a row via flexbox on the parent (.script-status
+            // in the stylesheet), not inline-block on each child --
+            // avoids needing an unconfirmed <span> tag just to get
+            // horizontal layout; div + CSS flex achieves the same thing
+            // using only the already-confirmed div/class pattern.
+            div(`class` := "script-status")(
+              div(`class` := badgeClass)(badgeText),
+              div(s"Script: ${d.script.name.getOrElse("-")}"),
+              div(progressText)
+            )
 
   // "47 calls · 3 failures · 12 streamed · OpenAI 31 / Anthropic 16 ·
   // p95 420 ms" -- makes the console read as a deterministic test-
@@ -124,26 +148,37 @@ object Main extends TyrianIOApp[Msg, Model]:
   // defaulting to 0), not guessed.
   private def summaryStripView(model: Model): Html[Msg] =
     model.dashboard match
-      case None => div()
+      case None => div(`class` := "status-message")("Summary: loading...")
       case Some(d) =>
         val failures = d.calls.byOutcome.getOrElse("rejected", 0) +
           d.calls.byOutcome.getOrElse("failed", 0) +
           d.calls.byOutcome.getOrElse("cancelled", 0)
+        val failuresSub =
+          if d.journal.retainedCalls > 0 then
+            f"${failures.toDouble / d.journal.retainedCalls * 100}%.0f%% of calls"
+          else "-"
         val p95Text = d.latencyMillis.p95.map(p => s"${p}ms").getOrElse("-")
-        div(
-          s"${d.journal.retainedCalls} call(s)" +
-            s" · $failures failure(s)" +
-            s" · ${d.calls.streamed} streamed" +
-            s" · OpenAI ${d.calls.byProvider.getOrElse("openai", 0)}" +
-            s" / Anthropic ${d.calls.byProvider.getOrElse("anthropic", 0)}" +
-            s" · p95 $p95Text"
+        val avgSub = d.latencyMillis.average.map(a => f"$a%.0fms avg").getOrElse("no data yet")
+        div(`class` := "summary-cards")(
+          summaryCard("Retained calls", d.journal.retainedCalls.toString, s"of ${d.journal.capacity} capacity"),
+          summaryCard("Failures", failures.toString, failuresSub),
+          summaryCard("Streamed", d.calls.streamed.toString,
+            s"OpenAI ${d.calls.byProvider.getOrElse("openai", 0)} / Anthropic ${d.calls.byProvider.getOrElse("anthropic", 0)}"),
+          summaryCard("Latency p95", p95Text, avgSub)
         )
+
+  private def summaryCard(label: String, value: String, sub: String): Html[Msg] =
+    div(`class` := "summary-card")(
+      div(`class` := "summary-card-label")(label),
+      div(`class` := "summary-card-value")(value),
+      div(`class` := "summary-card-sub")(sub)
+    )
 
   private def controlPanel(model: Model): Html[Msg] =
     val isPending = model.actionState match
       case ActionState.Pending(_) => true
       case _                      => false
-    div()(
+    div(`class` := "control-panel")(
       // "Reset script + clear calls" / "Clear calls only" -- Reset and
       // Clear read as near-synonyms even though they do genuinely
       // different things (Reset rewinds script position too, Clear
@@ -166,19 +201,19 @@ object Main extends TyrianIOApp[Msg, Model]:
       else button(onClick(Msg.ClearClicked))("Clear calls only"),
       model.actionState match
         case ActionState.Idle                  => div()
-        case ActionState.Pending(Action.Reset)  => div("Resetting...")
-        case ActionState.Pending(Action.Clear)  => div("Clearing...")
-        case ActionState.Succeeded(msg)         => div(msg)
-        case ActionState.Failed(msg)            => div(msg)
+        case ActionState.Pending(Action.Reset)  => div(`class` := "action-status")("Resetting...")
+        case ActionState.Pending(Action.Clear)  => div(`class` := "action-status")("Clearing...")
+        case ActionState.Succeeded(msg)         => div(`class` := "action-status action-status-success")(msg)
+        case ActionState.Failed(msg)            => div(`class` := "action-status action-status-error")(msg)
     )
 
   private def contentView(model: Model): Html[Msg] =
-    if model.loading then div("loading...")
+    if model.loading then div(`class` := "status-message")("Loading calls...")
     else
       model.error match
-        case Some(err) => div(s"fetch failed: $err")
+        case Some(err) => div(`class` := "status-message status-message-error")(s"Fetch failed: $err")
         case None =>
-          if model.calls.isEmpty then div("No calls yet.")
+          if model.calls.isEmpty then div(`class` := "status-message")("No calls yet.")
           else
             val filtered = model.calls.filter(matchesFilters(_, model))
             val selected = model.selectedSequence.flatMap(seq => filtered.find(_.sequence == seq))
@@ -188,7 +223,7 @@ object Main extends TyrianIOApp[Msg, Model]:
             // all of it" are different situations, and a reader
             // switching filters needs to be able to tell them apart.
             val tableOrEmptyNote: Html[Msg] =
-              if filtered.isEmpty then div("No calls match the current filters.")
+              if filtered.isEmpty then div(`class` := "status-message")("No calls match the current filters.")
               else callsTable(filtered, model.selectedSequence)
             val children: List[Html[Msg]] =
               filterPanel(model) :: tableOrEmptyNote :: selected.map(detailView).toList

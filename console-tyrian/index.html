@@ -134,6 +134,133 @@
   h3, h4 {
     margin: 12px 0 6px 0;
   }
+
+  /* App shell -- gives the page real visual identity from the very
+     first render, independent of whether any data has loaded yet.
+     Previously everything on screen depended on fetched data, so the
+     initial state was just bare "loading..." text with nothing
+     establishing what the page even was. */
+  .app-container {
+    max-width: 1200px;
+    margin: 0 auto;
+  }
+
+  .app-header h1 {
+    margin: 0 0 2px 0;
+    font-size: 26px;
+  }
+
+  .app-tagline {
+    color: #6b7280;
+    font-size: 14px;
+    margin-bottom: 16px;
+  }
+
+  /* Row layout for the script-status badge + text via flexbox on the
+     parent -- not inline-block on each child, which would need an
+     unconfirmed <span> tag to get right; this achieves the same
+     visual result using only the already-confirmed div + class
+     pattern. */
+  .script-status {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 14px;
+    font-size: 14px;
+  }
+
+  .status-badge {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 12px;
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }
+
+  .status-badge-running {
+    background: #d1fae5;
+    color: #065f46;
+  }
+
+  .status-badge-exhausted {
+    background: #fef3c7;
+    color: #92400e;
+  }
+
+  .summary-cards {
+    display: flex;
+    gap: 12px;
+    margin: 0 0 16px 0;
+    flex-wrap: wrap;
+  }
+
+  .summary-card {
+    background: white;
+    border: 1px solid #e0e0e6;
+    border-radius: 8px;
+    padding: 12px 16px;
+    min-width: 160px;
+    flex: 1;
+  }
+
+  .summary-card-label {
+    font-size: 12px;
+    color: #6b7280;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }
+
+  .summary-card-value {
+    font-size: 26px;
+    font-weight: 700;
+    margin: 2px 0;
+  }
+
+  .summary-card-sub {
+    font-size: 12px;
+    color: #6b7280;
+  }
+
+  .control-panel {
+    margin-bottom: 16px;
+  }
+
+  .action-status {
+    display: inline-block;
+    margin-left: 8px;
+    font-size: 14px;
+    color: #6b7280;
+  }
+
+  .action-status-success {
+    color: #065f46;
+  }
+
+  .action-status-error {
+    color: #b91c1c;
+  }
+
+  /* Consistent, intentional-looking treatment for every "nothing to
+     show yet / something went wrong" message -- loading, empty
+     journal, empty filter results, fetch errors -- instead of bare
+     unstyled text, which was a real part of what made the initial
+     page load feel unfinished. */
+  .status-message {
+    padding: 12px 16px;
+    background: white;
+    border: 1px solid #e0e0e6;
+    border-radius: 6px;
+    color: #6b7280;
+  }
+
+  .status-message-error {
+    color: #b91c1c;
+    border-color: #fca5a5;
+    background: #fef2f2;
+  }
 </style>
 </head>
 <body>
