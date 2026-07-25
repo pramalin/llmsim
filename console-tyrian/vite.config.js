@@ -53,6 +53,14 @@ const linkOutputDir = isDev()
   : printSbtTask("fullLinkOutputDir");
 
 export default defineConfig({
+  // Production builds (npm run build) will be served from
+  // /_llmsim/console/, not the domain root -- Vite's default base
+  // ("/") would make the built index.html reference assets at
+  // /assets/... instead of /_llmsim/console/assets/..., which would
+  // build cleanly and then silently fail to load in the browser. Only
+  // matters for `npm run build`; the dev server (npm run dev) ignores
+  // base and serves from its own root regardless.
+  base: "/_llmsim/console/",
   resolve: {
     alias: [
       {
