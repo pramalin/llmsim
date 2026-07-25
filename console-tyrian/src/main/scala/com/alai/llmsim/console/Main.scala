@@ -181,7 +181,10 @@ object Main extends TyrianIOApp[Msg, Model]:
           th("Seq"), th("Provider"), th("Model"), th("Outcome"), th("Streamed"), th("Duration (ms)")
         )
       ),
-      tbody()(calls.map(call => callRow(call, selected = selectedSequence.contains(call.sequence)))*)
+      // Newest first -- explicit descending sort by sequence, not
+      // .reverse, so this doesn't depend on assuming the API always
+      // returns calls in a particular order.
+      tbody()(calls.sortBy(c => -c.sequence).map(call => callRow(call, selected = selectedSequence.contains(call.sequence)))*)
     )
 
   private def callRow(call: CapturedCall, selected: Boolean): Html[Msg] =
