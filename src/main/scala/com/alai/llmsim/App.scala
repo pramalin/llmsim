@@ -3,7 +3,8 @@ package com.alai.llmsim
 import cats.effect.IO
 import cats.syntax.semigroupk._
 import org.http4s.{HttpApp, HttpRoutes, Uri}
-import org.http4s.headers.Origin
+import org.http4s.dsl.io._
+import org.http4s.headers.{Location, Origin}
 import org.http4s.implicits._
 import org.http4s.server.middleware.CORS
 import org.http4s.server.staticcontent.resourceServiceBuilder
@@ -32,8 +33,24 @@ object App {
     } yield withDevCors(
       (Simulator.routes(runner, journal) <+>
         ManagementRoutes.routes(journal, runner, journalMaxEntries, scriptName) <+>
+        consoleIndexRedirectRoutes <+>
         consoleRoutes).orNotFound
     )
+
+  // resourceServiceBuilder doesn't perform directory-index resolution
+  // -- confirmed directly by testing all three forms against a real
+  // running server: /_llmsim/console/index.html loads, but both
+  // /_llmsim/console and /_llmsim/console/ 404, even though the file
+  // genuinely exists in the jar (also confirmed directly, by
+  // extracting and listing the jar's contents). Explicit redirects for
+  // the two friendly forms people will actually type, both pointing at
+  // the one path that's confirmed to actually work.
+  private val consoleIndexRedirectRoutes: HttpRoutes[IO] = HttpRoutes.of[IO] {
+    case GET -> Root / "_llmsim" / "console" =>
+      TemporaryRedirect(Location(uri"/_llmsim/console/index.html"))
+    case GET -> Root / "_llmsim" / "console" / "" =>
+      TemporaryRedirect(Location(uri"/_llmsim/console/index.html"))
+  }
 
   // Stage 1 of packaging the real Tyrian console (roadmap item 16)
   // into the server itself. Serves whatever's under classpath
