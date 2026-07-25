@@ -47,7 +47,7 @@ object Main extends TyrianIOApp[Msg, Model]:
     (
       Model(calls = Nil, error = None, loading = true, dashboard = None, dashboardError = None,
         selectedSequence = None, actionState = ActionState.Idle,
-        providerFilter = None, outcomeFilter = None, streamedOnly = false),
+        providerFilter = None, outcomeFilter = None, streamedOnly = false, modelSearch = ""),
       Cmd.Batch(List(fetchCalls, fetchDashboard))
     )
 
@@ -80,6 +80,7 @@ object Main extends TyrianIOApp[Msg, Model]:
     case Msg.SetProviderFilter(p) => (model.copy(providerFilter = p), Cmd.None)
     case Msg.SetOutcomeFilter(o)  => (model.copy(outcomeFilter = o), Cmd.None)
     case Msg.ToggleStreamedOnly   => (model.copy(streamedOnly = !model.streamedOnly), Cmd.None)
+    case Msg.SetModelSearch(text) => (model.copy(modelSearch = text), Cmd.None)
     case Msg.NoOp                => (model, Cmd.None)
 
   def view(model: Model): Html[Msg] =
@@ -100,12 +101,17 @@ object Main extends TyrianIOApp[Msg, Model]:
         model.dashboard match
           case None => div("Script: loading...")
           case Some(d) =>
-            val exhaustedNote = if d.script.exhausted then " (EXHAUSTED)" else ""
-            div(
-              s"Script: ${d.script.name.getOrElse("-")}" +
-                s" | Step ${d.script.nextStepIndex.map(_.toString).getOrElse("-")} of ${d.script.totalSteps}" +
-                s" | On overrun: ${d.script.onOverrun}$exhaustedNote"
-            )
+            val progressText =
+              if d.script.exhausted then
+                s"exhausted -- the next request will use the ${d.script.onOverrun} overrun behavior"
+              else
+                // nextStepIndex is 0-based internally; +1 for a
+                // human-countable "Next response: 1 of N", clearer
+                // than the previous "Step 0 of N" (ambiguous -- has
+                // step 0 already happened, or is it next?).
+                s"Next response: ${d.script.nextStepIndex.map(_ + 1).getOrElse("-")} of ${d.script.totalSteps}" +
+                  s" (on overrun: ${d.script.onOverrun})"
+            div(s"Script: ${d.script.name.getOrElse("-")} -- $progressText")
 
   // "47 calls · 3 failures · 12 streamed · OpenAI 31 / Anthropic 16 ·
   // p95 420 ms" -- makes the console read as a deterministic test-
@@ -209,7 +215,17 @@ object Main extends TyrianIOApp[Msg, Model]:
       filterToggle("Cancelled", model.outcomeFilter.contains("cancelled"), Msg.SetOutcomeFilter(Some("cancelled"))),
       button(onClick(Msg.ToggleStreamedOnly))(
         if model.streamedOnly then "Streamed only: On" else "Streamed only: Off"
-      )
+      ),
+      // onInput confirmed working from Tyrian's own http4s-dom
+      // networking example (input(placeholder := "...", onInput(s =>
+      // Msg.UpdateRepo(s)))) -- not a new unverified pattern the way
+      // <select> would have been. Deliberately uncontrolled (no
+      // value := model.modelSearch binding), matching that same
+      // reference example -- a controlled input re-rendering on every
+      // keystroke is a common source of cursor-jumping bugs in Elm-
+      // style frameworks, and the reference example didn't need one
+      // either.
+      input(placeholder := "Search model...", onInput(s => Msg.SetModelSearch(s)))
     )
 
   private def filterToggle(label: String, active: Boolean, msg: Msg): Html[Msg] =
@@ -220,7 +236,9 @@ object Main extends TyrianIOApp[Msg, Model]:
     val providerOk = model.providerFilter.forall(_ == call.provider)
     val outcomeOk  = model.outcomeFilter.forall(_ == outcomeKey(call.outcome))
     val streamedOk = !model.streamedOnly || call.streamed
-    providerOk && outcomeOk && streamedOk
+    val searchTerm = model.modelSearch.trim.toLowerCase
+    val modelSearchOk = searchTerm.isEmpty || call.model.exists(_.toLowerCase.contains(searchTerm))
+    providerOk && outcomeOk && streamedOk && modelSearchOk
 
   // Matches Dashboard.scala's own outcomeKey exactly (responded/
   // rejected/failed/cancelled) -- the same lowercase discriminator
@@ -353,7 +371,12 @@ final case class Model(
     // "filtering by nothing" can't be confused.
     providerFilter: Option[String],
     outcomeFilter: Option[String],
-    streamedOnly: Boolean
+    streamedOnly: Boolean,
+    // Empty string means "no filter", not None -- unlike the
+    // provider/outcome toggle filters, this one's driven by a text
+    // input, which naturally has "" as its own genuine empty state,
+    // no need for a separate Option wrapper on top of it.
+    modelSearch: String
 )
 
 enum Action:
@@ -386,4 +409,5 @@ enum Msg:
   case SetProviderFilter(provider: Option[String])
   case SetOutcomeFilter(outcome: Option[String])
   case ToggleStreamedOnly
+  case SetModelSearch(text: String)
   case NoOp
