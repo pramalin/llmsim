@@ -53,14 +53,26 @@ const linkOutputDir = isDev()
   : printSbtTask("fullLinkOutputDir");
 
 export default defineConfig({
-  // Production builds (npm run build) will be served from
-  // /_llmsim/console/, not the domain root -- Vite's default base
-  // ("/") would make the built index.html reference assets at
-  // /assets/... instead of /_llmsim/console/assets/..., which would
-  // build cleanly and then silently fail to load in the browser. Only
-  // matters for `npm run build`; the dev server (npm run dev) ignores
-  // base and serves from its own root regardless.
-  base: "/_llmsim/console/",
+  // Production builds only (npm run build) -- llmsim serves the built
+  // console from /_llmsim/console/, not the domain root, so the built
+  // index.html needs assets referenced from there, not "/assets/...".
+  //
+  // Confirmed the hard way: my first version of this comment claimed
+  // "the dev server ignores base and serves from its own root
+  // regardless" -- that was wrong, not just imprecise. Vite's dev
+  // server actually has its own base middleware that redirects the
+  // root to the configured base path and then expects index.html to
+  // exist nested under it on disk (confirmed via real Vite GitHub
+  // issues showing the identical redirect-then-404 pattern), which
+  // ours never was -- console-tyrian/index.html lives at the project
+  // root, not under _llmsim/console/. Reusing isDev() here rather than
+  // introducing Vite's separate command parameter as a second, newer
+  // mechanism to distinguish dev from build -- isDev() is already
+  // proven correct (it's what fastLinkOutputDir vs fullLinkOutputDir
+  // below has relied on since this file was first written), so this
+  // keeps one single source of truth for that distinction rather than
+  // two that could disagree.
+  base: isDev() ? "/" : "/_llmsim/console/",
   // Dev-server only (npm run dev). Main.scala now fetches same-origin
   // relative paths (/_llmsim/calls, not a hardcoded absolute URL) --
   // correct for production (served by llmsim itself), but during dev
