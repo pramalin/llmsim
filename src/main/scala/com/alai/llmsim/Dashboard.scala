@@ -1,13 +1,9 @@
 package com.alai.llmsim
 
-import io.circe.{Encoder, Json}
-import io.circe.generic.semiauto.deriveEncoder
-import io.circe.syntax._
-
 /** The bare-bones dashboard (roadmap item 13): a plain JSON summary
   * (`GET /_llmsim/dashboard`) plus a zero-build static HTML page that
   * polls and renders it (`GET /_llmsim/ui`). Not a final UI -- the real
-  * Angular console (roadmap item 16) will eventually replace the page
+  * Tyrian console (roadmap item 16) will eventually replace the page
   * at that same path; the data model here is deliberately simple enough
   * that it doesn't need to anticipate that redesign.
   *
@@ -19,55 +15,19 @@ object Dashboard {
 
   val SchemaVersion = 1
 
-  final case class ScriptSummary(
-      name: Option[String],
-      totalSteps: Int,
-      nextStepIndex: Option[Int],
-      onOverrun: String,
-      exhausted: Boolean
-  )
-
-  final case class JournalSummary(retainedCalls: Int, capacity: Int)
-
-  final case class CallsSummary(
-      byOutcome: Map[String, Int],
-      byProvider: Map[String, Int],
-      streamed: Int
-  )
-
-  /** `average`/`p95`/`max` and `lastCallAtEpochMillis` (on the enclosing
-    * summary) are `None`, not `0`, when the journal is empty -- a
-    * fresh, idle simulator should read as "no data yet," not "average
-    * latency 0ms," which would be a real answer to a question nobody
-    * asked.
-    */
-  final case class LatencySummary(
-      sampleCount: Int,
-      average: Option[Double],
-      p95: Option[Long],
-      max: Option[Long]
-  )
-
-  final case class DashboardSummary(
-      schemaVersion: Int,
-      script: ScriptSummary,
-      journal: JournalSummary,
-      calls: CallsSummary,
-      latencyMillis: LatencySummary,
-      lastCallAtEpochMillis: Option[Long]
-  )
-
-  implicit val scriptSummaryEncoder: Encoder[ScriptSummary] = deriveEncoder
-  implicit val journalSummaryEncoder: Encoder[JournalSummary] = deriveEncoder
-  implicit val callsSummaryEncoder: Encoder[CallsSummary] = deriveEncoder
-  implicit val latencySummaryEncoder: Encoder[LatencySummary] = deriveEncoder
-  implicit val dashboardSummaryEncoder: Encoder[DashboardSummary] = deriveEncoder
+  // ScriptSummary, JournalSummary, CallsSummary, LatencySummary, and
+  // DashboardSummary itself all moved to common/ (see
+  // DashboardSummary.scala there), shared with the console. Same
+  // package, so nothing below needed to change beyond removing these
+  // five duplicate definitions -- summarize() still refers to them
+  // unqualified, resolved via same-package visibility instead of
+  // nested-object membership.
 
   // "fail"/"repeatLast"/"cycle" -- the actual Scala case-object names
   // with just the first letter lowercased, not Scala's raw .toString
   // (which would leak "Fail"/"RepeatLast"/"Cycle" -- fine internally,
-  // but this is a wire contract a future Angular client will depend on,
-  // so it gets an explicit, stable mapping instead).
+  // but this is a wire contract the real console client will depend
+  // on, so it gets an explicit, stable mapping instead).
   private def overrunName(o: Overrun): String = o match {
     case Overrun.Fail       => "fail"
     case Overrun.RepeatLast => "repeatLast"

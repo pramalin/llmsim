@@ -6,53 +6,77 @@ import tyrian.classic.*
 import org.http4s.{Method, Request, Uri}
 import org.http4s.circe.CirceEntityCodec.*
 import org.http4s.dom.FetchClientBuilder
-import com.alai.llmsim.{CallOutcome, CapturedCall}
+import com.alai.llmsim.{CallOutcome, CapturedCall, DashboardSummary}
 
 import scala.scalajs.js.annotation.*
 
-// Adds Reset and Clear -- the last real behavior piece from the
-// vertical slice plan (docs/console-framework-decision.md). Pending/
-// success/failure all represented: actionPending disables nothing yet
-// (deliberately -- see below) but shows "Working...", actionStatus
-// holds whichever of the two outcomes happened last.
+// Adds script status, fetched from /_llmsim/dashboard alongside
+// /_llmsim/calls -- the piece that would have made the earlier reset-
+// vs-clear confusion visible in the console itself instead of needing
+// three rounds of curl to sort out. Separate dashboard/dashboardError
+// fields, deliberately not reusing the existing calls-fetch error --
+// one fetch failing shouldn't hide the other succeeding.
 //
-// Deliberately did NOT reach for `disabled := model.actionPending` on
-// the buttons -- that's a new, unconfirmed attribute pattern, and
-// this step already has one new one (POST/DELETE via a raw Request,
-// not the .expect[A](url) convenience method used everywhere else so
-// far). Keeping new unverified surface area to one thing per step,
-// same discipline as every step before this one.
+// Cmd.Batch confirmed directly from Tyrian's actual source
+// (github.com/PurpleKingdomGames/tyrian, Cmd.scala) before use here,
+// not assumed -- the one genuinely new API surface this step
+// introduces. Reset/Clear's success handler now re-fetches BOTH calls
+// and dashboard via Cmd.Batch, which is the actual fix for the
+// original problem: script position changing on Reset but not Clear
+// is now something the console shows directly.
 @JSExportTopLevel("TyrianApp")
 object Main extends TyrianIOApp[Msg, Model]:
 
   def router: Location => Msg = Routing.none(Msg.NoOp)
 
   def init(flags: Map[String, String]): (Model, Cmd[IO, Msg]) =
-    (Model(calls = Nil, error = None, loading = true, selectedSequence = None,
-      actionPending = false, actionStatus = None), fetchCalls)
+    (
+      Model(calls = Nil, error = None, loading = true, dashboard = None, dashboardError = None,
+        selectedSequence = None, actionPending = false, actionStatus = None),
+      Cmd.Batch(List(fetchCalls, fetchDashboard))
+    )
 
   def update(model: Model): Msg => (Model, Cmd[IO, Msg]) =
     case Msg.CallsLoaded(calls) => (model.copy(calls = calls, error = None, loading = false), Cmd.None)
     case Msg.FetchError(err)    => (model.copy(error = Some(err), loading = false), Cmd.None)
+    case Msg.DashboardLoaded(summary) => (model.copy(dashboard = Some(summary), dashboardError = None), Cmd.None)
+    case Msg.DashboardFetchError(err) => (model.copy(dashboardError = Some(err)), Cmd.None)
     case Msg.SelectCall(seq)    => (model.copy(selectedSequence = Some(seq)), Cmd.None)
     case Msg.ResetClicked       => (model.copy(actionPending = true, actionStatus = None), resetSimulator)
     case Msg.ClearClicked       => (model.copy(actionPending = true, actionStatus = None), clearCalls)
     case Msg.ActionSucceeded(msg) =>
-      // Re-fetch after a successful reset/clear -- the journal just
-      // changed, and the previously-selected call may no longer exist,
-      // so it's cleared rather than left pointing at stale data.
-      (model.copy(actionPending = false, actionStatus = Some(msg), selectedSequence = None), fetchCalls)
+      // Re-fetch both after a successful reset/clear -- the journal
+      // changed either way, but script position only changes for
+      // Reset, so both need refreshing for that difference to actually
+      // show up here rather than needing a separate curl to see.
+      (model.copy(actionPending = false, actionStatus = Some(msg), selectedSequence = None),
+        Cmd.Batch(List(fetchCalls, fetchDashboard)))
     case Msg.ActionFailed(msg) => (model.copy(actionPending = false, actionStatus = Some(msg)), Cmd.None)
     case Msg.NoOp                => (model, Cmd.None)
 
   def view(model: Model): Html[Msg] =
     div()(
+      scriptStatusView(model),
       controlPanel(model),
       contentView(model)
     )
 
   def subscriptions(model: Model): Sub[IO, Msg] =
     Sub.None
+
+  private def scriptStatusView(model: Model): Html[Msg] =
+    model.dashboardError match
+      case Some(err) => div(s"Script status unavailable: $err")
+      case None =>
+        model.dashboard match
+          case None => div("Script: loading...")
+          case Some(d) =>
+            val exhaustedNote = if d.script.exhausted then " (EXHAUSTED)" else ""
+            div(
+              s"Script: ${d.script.name.getOrElse("-")}" +
+                s" | Step ${d.script.nextStepIndex.map(_.toString).getOrElse("-")} of ${d.script.totalSteps}" +
+                s" | On overrun: ${d.script.onOverrun}$exhaustedNote"
+            )
 
   private def controlPanel(model: Model): Html[Msg] =
     div()(
@@ -128,9 +152,6 @@ object Main extends TyrianIOApp[Msg, Model]:
     case CallOutcome.Failed(message)           => s"Failed: $message"
     case CallOutcome.Cancelled(message)        => s"Cancelled: $message"
 
-  // Same shape as Tyrian's own confirmed http4s-dom networking example
-  // (client.expect[...].attempt.map { case Right/Left => ... }), just
-  // targeting llmsim's real management API instead of GitHub's.
   private def fetchCalls: Cmd[IO, Msg] =
     val client = FetchClientBuilder[IO].create
     val fetch: IO[Msg] =
@@ -143,23 +164,26 @@ object Main extends TyrianIOApp[Msg, Model]:
         }
     Cmd.Run(fetch)(identity)
 
+  // Same shape as fetchCalls -- .expect[A](url), already confirmed
+  // working, just decoding DashboardSummary instead of List[CapturedCall].
+  private def fetchDashboard: Cmd[IO, Msg] =
+    val client = FetchClientBuilder[IO].create
+    val fetch: IO[Msg] =
+      client
+        .expect[DashboardSummary]("http://localhost:8089/_llmsim/dashboard")
+        .attempt
+        .map {
+          case Right(summary) => Msg.DashboardLoaded(summary)
+          case Left(err)       => Msg.DashboardFetchError(err.getMessage)
+        }
+    Cmd.Run(fetch)(identity)
+
   private def resetSimulator: Cmd[IO, Msg] =
     runAction(Method.POST, "http://localhost:8089/_llmsim/reset", "Reset")
 
   private def clearCalls: Cmd[IO, Msg] =
     runAction(Method.DELETE, "http://localhost:8089/_llmsim/calls", "Clear")
 
-  // New this step: a raw Request[IO] with an explicit method, rather
-  // than the .expect[A](url) convenience method fetchCalls uses --
-  // POST/DELETE have no body to decode, just success or failure.
-  // client.successful(req): IO[Boolean] is a standard http4s Client
-  // method (true for a 2xx response), and http4s-dom's FetchClientBuilder
-  // produces an ordinary org.http4s.client.Client[IO], so the same
-  // Client API that's well-established on llmsim's own JVM side should
-  // apply here too -- reasonable confidence, not a direct confirmation
-  // the way fetchCalls's exact shape was (that one came from a real,
-  // cloned Tyrian example; this one is inferred from standard http4s
-  // API knowledge instead).
   private def runAction(method: Method, url: String, actionLabel: String): Cmd[IO, Msg] =
     val client = FetchClientBuilder[IO].create
     val request = Request[IO](method, Uri.unsafeFromString(url))
@@ -178,6 +202,8 @@ final case class Model(
     calls: List[CapturedCall],
     error: Option[String],
     loading: Boolean,
+    dashboard: Option[DashboardSummary],
+    dashboardError: Option[String],
     selectedSequence: Option[Long],
     actionPending: Boolean,
     actionStatus: Option[String]
@@ -186,6 +212,8 @@ final case class Model(
 enum Msg:
   case CallsLoaded(calls: List[CapturedCall])
   case FetchError(message: String)
+  case DashboardLoaded(summary: DashboardSummary)
+  case DashboardFetchError(message: String)
   case SelectCall(sequence: Long)
   case ResetClicked
   case ClearClicked
