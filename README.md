@@ -10,6 +10,10 @@ It runs as a single instance and answers both `POST /v1/chat/completions`
 time, on the same port. What it replies with is decided entirely at
 startup, by a script you write.
 
+![llmsim in a development environment: the same agentic application, tool integrations, and data stay real across development/CI and QA/production -- only the LLM endpoint swaps between llmsim's simulated responses and a real model provider](docs/images/llmsim-architecture.png)
+
+![llmsim console: a real run of the VerificationFlow script, showing the call journal, summary cards, provider/outcome filters, and a selected tool-call's full request/response detail](docs/images/llmsim-console.png)
+
 ## Trying it out
 
 With `docker compose up` running, in another terminal:
