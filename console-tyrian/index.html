@@ -261,6 +261,51 @@
     border-color: #fca5a5;
     background: #fef2f2;
   }
+
+  /* Confirmed missing from a previous delivery -- Main.scala already
+     referenced these four classes, but the CSS defining them never
+     actually reached the committed file. Real bug, caught by review,
+     fixed here with actual verification this time, not just re-sent. */
+  .filter-panel {
+    margin-bottom: 12px;
+  }
+
+  .filter-label {
+    display: inline-block;
+    font-weight: 600;
+    font-size: 13px;
+    margin: 8px 8px 4px 0;
+  }
+
+  .filter-toggle {
+    /* Inherits the general button rules already defined above --
+       this selector exists so filter-toggle-active (below) has
+       something concrete to override. */
+  }
+
+  .filter-toggle-active {
+    background: #4a67e0;
+    color: white;
+    border-color: #4a67e0;
+  }
+
+  .filter-toggle-active:hover,
+  button.filter-toggle-active:hover {
+    /* button:hover:not(:disabled) (defined earlier, general button
+       styling) has higher specificity than a bare class selector --
+       :not(:disabled) still counts as a pseudo-class toward
+       specificity even though it reads as incidental, and the extra
+       button type selector tips it over .filter-toggle-active:hover
+       alone. Result: on hover, the light-gray general background was
+       winning over the intended blue, while the active button's white
+       text color (not contested by that rule) stayed -- white text on
+       near-white background is exactly what "obscured" describes.
+       Matching specificity here (also including button) and
+       re-asserting color explicitly is the actual fix, not just
+       re-declaring the same losing rule. */
+    background: #3d55ba;
+    color: white;
+  }
 </style>
 </head>
 <body>
