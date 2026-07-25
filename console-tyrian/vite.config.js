@@ -61,6 +61,20 @@ export default defineConfig({
   // matters for `npm run build`; the dev server (npm run dev) ignores
   // base and serves from its own root regardless.
   base: "/_llmsim/console/",
+  // Dev-server only (npm run dev). Main.scala now fetches same-origin
+  // relative paths (/_llmsim/calls, not a hardcoded absolute URL) --
+  // correct for production (served by llmsim itself), but during dev
+  // the Vite server (5173) and llmsim (8089) are still genuinely
+  // different origins. This proxy makes the SAME relative paths work
+  // in dev too, forwarding anything under /_llmsim to llmsim directly
+  // -- the console no longer needs LLMSIM_DEV_CORS (App.scala) to
+  // develop against, though that stays available in case anything
+  // else wants cross-origin access to llmsim's API.
+  server: {
+    proxy: {
+      "/_llmsim": "http://localhost:8089",
+    },
+  },
   resolve: {
     alias: [
       {

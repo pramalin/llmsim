@@ -10,6 +10,20 @@ import com.alai.llmsim.{CallOutcome, CapturedCall, DashboardSummary}
 
 import scala.scalajs.js.annotation.*
 
+// Same-origin relative paths (/_llmsim/calls, not
+// http://localhost:8089/_llmsim/calls) -- the hardcoded absolute URL
+// was a real deployment bug, not just a dev convenience: it would
+// break under Docker port-mapping, a different host, HTTPS, or a
+// reverse proxy, none of which match localhost:8089 specifically. The
+// console is genuinely same-origin now that it's served by llmsim
+// itself (see App.scala's resourceServiceBuilder route), so a
+// relative path is both correct AND simpler than the URL it replaces.
+// For local dev against a separate Vite server, console-tyrian/
+// vite.config.js now proxies /_llmsim to localhost:8089 instead --
+// same relative paths work in both places, and LLMSIM_DEV_CORS
+// (App.scala) is no longer something the console itself needs to lean
+// on, though it's left in place in case something else wants it.
+
 // Adds script status, fetched from /_llmsim/dashboard alongside
 // /_llmsim/calls -- the piece that would have made the earlier reset-
 // vs-clear confusion visible in the console itself instead of needing
@@ -156,7 +170,7 @@ object Main extends TyrianIOApp[Msg, Model]:
     val client = FetchClientBuilder[IO].create
     val fetch: IO[Msg] =
       client
-        .expect[List[CapturedCall]]("http://localhost:8089/_llmsim/calls")
+        .expect[List[CapturedCall]]("/_llmsim/calls")
         .attempt
         .map {
           case Right(calls) => Msg.CallsLoaded(calls)
@@ -170,7 +184,7 @@ object Main extends TyrianIOApp[Msg, Model]:
     val client = FetchClientBuilder[IO].create
     val fetch: IO[Msg] =
       client
-        .expect[DashboardSummary]("http://localhost:8089/_llmsim/dashboard")
+        .expect[DashboardSummary]("/_llmsim/dashboard")
         .attempt
         .map {
           case Right(summary) => Msg.DashboardLoaded(summary)
@@ -179,10 +193,10 @@ object Main extends TyrianIOApp[Msg, Model]:
     Cmd.Run(fetch)(identity)
 
   private def resetSimulator: Cmd[IO, Msg] =
-    runAction(Method.POST, "http://localhost:8089/_llmsim/reset", "Reset")
+    runAction(Method.POST, "/_llmsim/reset", "Reset")
 
   private def clearCalls: Cmd[IO, Msg] =
-    runAction(Method.DELETE, "http://localhost:8089/_llmsim/calls", "Clear")
+    runAction(Method.DELETE, "/_llmsim/calls", "Clear")
 
   private def runAction(method: Method, url: String, actionLabel: String): Cmd[IO, Msg] =
     val client = FetchClientBuilder[IO].create
