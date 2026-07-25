@@ -11,6 +11,14 @@ project/project/
 node_modules/
 dist/
 
+# The built console, copied manually into place during stage 1 of
+# packaging it into the release image -- now regenerated automatically
+# by the Docker build (console-tyrian-build stage -> COPY into build's
+# resources before sbt assembly, see Dockerfile), so committing these
+# would just be stale build output, the same category as the two
+# entries above.
+src/main/resources/_llmsim/console/
+
 # Metals / Bloop (Scala IDE tooling)
 .bloop/
 .bsp/
