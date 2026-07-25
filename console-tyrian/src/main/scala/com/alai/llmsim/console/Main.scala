@@ -1,6 +1,7 @@
 package com.alai.llmsim.console
 
 import cats.effect.IO
+import fs2.Stream
 import tyrian.classic.Html.*
 import tyrian.classic.*
 import org.http4s.{Method, Request, Uri}
@@ -49,6 +50,7 @@ object Main extends TyrianIOApp[Msg, Model]:
     (
       Model(calls = Nil, error = None, loading = true, dashboard = None, dashboardError = None,
         selectedSequence = None, actionState = ActionState.Idle, refreshing = false, lastRefreshedAt = None,
+        autoRefresh = false,
         providerFilter = None, outcomeFilter = None, streamedOnly = false, modelSearch = ""),
       Cmd.Batch(List(fetchCalls, fetchDashboard))
     )
@@ -77,6 +79,7 @@ object Main extends TyrianIOApp[Msg, Model]:
       // in flight.
       if model.refreshing then (model, Cmd.None)
       else (model.copy(refreshing = true), Cmd.Batch(List(fetchCalls, fetchDashboard)))
+    case Msg.ToggleAutoRefresh => (model.copy(autoRefresh = !model.autoRefresh), Cmd.None)
     case Msg.ResetClicked =>
       model.actionState match
         // The real safety net against double-clicks: ignored outright
@@ -123,20 +126,25 @@ object Main extends TyrianIOApp[Msg, Model]:
       div(`class` := "app-tagline")("Deterministic LLM API simulation and request inspection")
     )
 
-  // Auto-refresh deliberately not implemented -- Sub.every, which
-  // would provide exactly this, genuinely doesn't exist anywhere in
-  // tyrian.platform.Sub for this pinned Tyrian version (confirmed by
-  // reading tyrian-platform/src/tyrian/platform/Sub.scala directly
-  // from the actual current source, not inferred from an example that
-  // turned out to be from a different version). Building a custom
-  // timer from Sub.make + org.scalajs.dom's setInterval/clearInterval
-  // is possible in principle, but needs real, version-pinned
-  // verification of that facade's exact signature before attempting
-  // it again -- not done here after two failed guesses already.
-  // Manual Refresh (controlPanel) covers the actual requirement in
-  // the meantime.
+  // Sub.every genuinely doesn't exist in this Tyrian version -- Sub.
+  // fromStream does, confirmed by extracting Sub.scala directly from
+  // the resolved sources jar for the exact pinned artifact
+  // (io.indigoengine:tyrian-platform_sjs1_3:0.30.0-M4-PREVIEW, fetched
+  // via `cs fetch --sources` and inspected directly), not inferred
+  // from an example or a different version this time. Real signature:
+  // def fromStream[F[_]: Async, A](id: String, stream: Stream[F, A]):
+  // Sub[F, A] -- takes an explicit id and an fs2.Stream, IO already
+  // satisfies Async[F]. Stream.awakeEvery is standard, stable FS2
+  // (already a real dependency here via http4s-dom), not another
+  // Tyrian preview internal to verify. .as(Msg.RefreshClicked) makes
+  // the stream already produce Msg directly, so fromStream needs no
+  // further .map -- reuses the already-proven RefreshClicked handling
+  // entirely, including its guard against overlapping fetches, rather
+  // than introducing a parallel path just for the timer case.
   def subscriptions(model: Model): Sub[IO, Msg] =
-    Sub.None
+    if model.autoRefresh then
+      Sub.fromStream("console-auto-refresh", Stream.awakeEvery[IO](3.seconds).as(Msg.RefreshClicked))
+    else Sub.None
 
   private def scriptStatusView(model: Model): Html[Msg] =
     model.dashboard match
@@ -268,6 +276,12 @@ object Main extends TyrianIOApp[Msg, Model]:
       // machinery.
       if model.refreshing then button(onClick(Msg.RefreshClicked), disabled)("Refresh")
       else button(onClick(Msg.RefreshClicked))("Refresh"),
+      // Same checkbox-glyph-on-a-plain-button pattern as the
+      // streamed-only filter toggle -- proven, no new attribute
+      // behavior to verify.
+      button(onClick(Msg.ToggleAutoRefresh))(
+        if model.autoRefresh then "☑ Auto-refresh (3s)" else "☐ Auto-refresh (3s)"
+      ),
       (model.lastRefreshedAt match
         case Some(t) => div(`class` := "last-refreshed")(s"Updated $t")
         case None    => div()
@@ -547,6 +561,7 @@ final case class Model(
     // (whichever completes first) -- a plain timestamp of the last
     // moment either side of the console's data was confirmed current.
     lastRefreshedAt: Option[String],
+    autoRefresh: Boolean,
     // None means "no filter" (show everything) for both -- not an
     // empty string or a sentinel value, so "not filtering" and
     // "filtering by nothing" can't be confused.
@@ -585,6 +600,7 @@ enum Msg:
   case SelectCall(sequence: Long)
   case ResetClicked
   case RefreshClicked
+  case ToggleAutoRefresh
   case ClearClicked
   case ActionSucceeded(message: String)
   case ActionFailed(message: String)
