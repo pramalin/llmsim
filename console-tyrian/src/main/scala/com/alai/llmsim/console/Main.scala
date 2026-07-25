@@ -283,7 +283,7 @@ object Main extends TyrianIOApp[Msg, Model]:
     div(`class` := "summary-card")(children*)
 
   private def controlPanel(model: Model): Html[Msg] =
-    val isPending = !noOperationInProgress(model)
+    val controlsBlocked = !noOperationInProgress(model)
     div(`class` := "control-panel")(
       // "Reset script + clear calls" / "Clear calls only" -- Reset and
       // Clear read as near-synonyms even though they do genuinely
@@ -301,9 +301,9 @@ object Main extends TyrianIOApp[Msg, Model]:
       // conditionally instead, each branch its own complete button
       // call rather than trying to build a mixed attribute list of an
       // unconfirmed common type.
-      if isPending then button(onClick(Msg.ResetClicked), disabled)("Reset script + clear calls")
+      if controlsBlocked then button(onClick(Msg.ResetClicked), disabled)("Reset script + clear calls")
       else button(onClick(Msg.ResetClicked))("Reset script + clear calls"),
-      if isPending then button(onClick(Msg.ClearClicked), disabled)("Clear calls only")
+      if controlsBlocked then button(onClick(Msg.ClearClicked), disabled)("Clear calls only")
       else button(onClick(Msg.ClearClicked))("Clear calls only"),
       // Refresh is deliberately not part of ActionState -- it isn't
       // destructive the way Reset/Clear are, just a plain guard in
