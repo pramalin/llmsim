@@ -46,7 +46,7 @@ object Main extends TyrianIOApp[Msg, Model]:
   def init(flags: Map[String, String]): (Model, Cmd[IO, Msg]) =
     (
       Model(calls = Nil, error = None, loading = true, dashboard = None, dashboardError = None,
-        selectedSequence = None, actionPending = false, actionStatus = None),
+        selectedSequence = None, actionState = ActionState.Idle),
       Cmd.Batch(List(fetchCalls, fetchDashboard))
     )
 
@@ -56,16 +56,26 @@ object Main extends TyrianIOApp[Msg, Model]:
     case Msg.DashboardLoaded(summary) => (model.copy(dashboard = Some(summary), dashboardError = None), Cmd.None)
     case Msg.DashboardFetchError(err) => (model.copy(dashboardError = Some(err)), Cmd.None)
     case Msg.SelectCall(seq)    => (model.copy(selectedSequence = Some(seq)), Cmd.None)
-    case Msg.ResetClicked       => (model.copy(actionPending = true, actionStatus = None), resetSimulator)
-    case Msg.ClearClicked       => (model.copy(actionPending = true, actionStatus = None), clearCalls)
+    case Msg.ResetClicked =>
+      model.actionState match
+        // The real safety net against double-clicks: ignored outright
+        // while an action's already in flight, regardless of whether
+        // disabled := isPending (below, in controlPanel) actually
+        // works as expected -- that one's unverified, this isn't.
+        case ActionState.Pending(_) => (model, Cmd.None)
+        case _                      => (model.copy(actionState = ActionState.Pending(Action.Reset)), resetSimulator)
+    case Msg.ClearClicked =>
+      model.actionState match
+        case ActionState.Pending(_) => (model, Cmd.None)
+        case _                      => (model.copy(actionState = ActionState.Pending(Action.Clear)), clearCalls)
     case Msg.ActionSucceeded(msg) =>
       // Re-fetch both after a successful reset/clear -- the journal
       // changed either way, but script position only changes for
       // Reset, so both need refreshing for that difference to actually
       // show up here rather than needing a separate curl to see.
-      (model.copy(actionPending = false, actionStatus = Some(msg), selectedSequence = None),
+      (model.copy(actionState = ActionState.Succeeded(msg), selectedSequence = None),
         Cmd.Batch(List(fetchCalls, fetchDashboard)))
-    case Msg.ActionFailed(msg) => (model.copy(actionPending = false, actionStatus = Some(msg)), Cmd.None)
+    case Msg.ActionFailed(msg) => (model.copy(actionState = ActionState.Failed(msg)), Cmd.None)
     case Msg.NoOp                => (model, Cmd.None)
 
   def view(model: Model): Html[Msg] =
@@ -93,14 +103,36 @@ object Main extends TyrianIOApp[Msg, Model]:
             )
 
   private def controlPanel(model: Model): Html[Msg] =
+    val isPending = model.actionState match
+      case ActionState.Pending(_) => true
+      case _                      => false
     div()(
-      button(onClick(Msg.ResetClicked))("Reset"),
-      button(onClick(Msg.ClearClicked))("Clear"),
-      if model.actionPending then div("Working...")
-      else
-        model.actionStatus match
-          case Some(msg) => div(msg)
-          case None      => div()
+      // "Reset script + clear calls" / "Clear calls only" -- Reset and
+      // Clear read as near-synonyms even though they do genuinely
+      // different things (Reset rewinds script position too, Clear
+      // doesn't) -- confirmed for real via dashboard's nextStepIndex
+      // a few sessions back, not just asserted. Longer labels spell out
+      // the actual difference instead of relying on the reader already
+      // knowing it.
+      //
+      // disabled is a complete, pre-built attribute in Tyrian (real
+      // HTML boolean-attribute semantics: present or absent, never
+      // disabled="true"/"false"), not a String => Attribute function
+      // like style/id/placeholder -- disabled := isPending was a real
+      // compile error caught immediately, not a silent bug. Included
+      // conditionally instead, each branch its own complete button
+      // call rather than trying to build a mixed attribute list of an
+      // unconfirmed common type.
+      if isPending then button(onClick(Msg.ResetClicked), disabled)("Reset script + clear calls")
+      else button(onClick(Msg.ResetClicked))("Reset script + clear calls"),
+      if isPending then button(onClick(Msg.ClearClicked), disabled)("Clear calls only")
+      else button(onClick(Msg.ClearClicked))("Clear calls only"),
+      model.actionState match
+        case ActionState.Idle                  => div()
+        case ActionState.Pending(Action.Reset)  => div("Resetting...")
+        case ActionState.Pending(Action.Clear)  => div("Clearing...")
+        case ActionState.Succeeded(msg)         => div(msg)
+        case ActionState.Failed(msg)            => div(msg)
     )
 
   private def contentView(model: Model): Html[Msg] =
@@ -219,9 +251,25 @@ final case class Model(
     dashboard: Option[DashboardSummary],
     dashboardError: Option[String],
     selectedSequence: Option[Long],
-    actionPending: Boolean,
-    actionStatus: Option[String]
+    actionState: ActionState
 )
+
+enum Action:
+  case Reset
+  case Clear
+
+// Replaces the earlier actionPending: Boolean / actionStatus:
+// Option[String] pair -- that combination technically allowed
+// contradictory states (pending AND holding a leftover status message
+// from the last run, simultaneously) that never should have been
+// representable in the first place. Same "make illegal states
+// unrepresentable" reasoning that motivated choosing Tyrian over a
+// more ad-hoc frontend approach to begin with.
+enum ActionState:
+  case Idle
+  case Pending(action: Action)
+  case Succeeded(message: String)
+  case Failed(message: String)
 
 enum Msg:
   case CallsLoaded(calls: List[CapturedCall])
