@@ -7,7 +7,7 @@ import tyrian.classic.*
 import org.http4s.{Method, Request, Uri}
 import org.http4s.circe.CirceEntityCodec.*
 import org.http4s.dom.FetchClientBuilder
-import com.alai.llmsim.{CallOutcome, CapturedCall, DashboardSummary}
+import com.alai.llmsim.{CallOutcome, CapturedCall, CapturedHeader, DashboardSummary}
 
 import scala.concurrent.duration._
 import scala.scalajs.js
@@ -50,7 +50,7 @@ object Main extends TyrianIOApp[Msg, Model]:
     (
       Model(calls = Nil, error = None, loading = true, dashboard = None, dashboardError = None,
         selectedSequence = None, actionState = ActionState.Idle, refreshing = false, lastRefreshedAt = None,
-        autoRefresh = false,
+        autoRefresh = false, selectedDetailTab = DetailTab.Summary,
         providerFilter = None, outcomeFilter = None, streamedOnly = false, modelSearch = ""),
       Cmd.Batch(List(fetchCalls, fetchDashboard))
     )
@@ -73,6 +73,7 @@ object Main extends TyrianIOApp[Msg, Model]:
     case Msg.DashboardFetchError(err) =>
       (model.copy(dashboardError = Some(err), refreshing = false), Cmd.None)
     case Msg.SelectCall(seq)    => (model.copy(selectedSequence = Some(seq)), Cmd.None)
+    case Msg.SelectDetailTab(tab) => (model.copy(selectedDetailTab = tab), Cmd.None)
     case Msg.RefreshClicked =>
       // Not destructive like Reset/Clear, so no ActionState needed --
       // just a plain guard against a redundant fetch if one's already
@@ -325,7 +326,7 @@ object Main extends TyrianIOApp[Msg, Model]:
         if filtered.isEmpty then div(`class` := "status-message")("No calls match the current filters.")
         else callsTable(filtered, model.selectedSequence)
       val children: List[Html[Msg]] =
-        staleWarning :: filterPanel(model) :: tableOrEmptyNote :: selected.map(detailView).toList
+        staleWarning :: filterPanel(model) :: tableOrEmptyNote :: selected.map(c => detailView(c, model.selectedDetailTab)).toList
       div()(children*)
 
   // Button-toggle filters, not <select> dropdowns -- select/option and
@@ -459,23 +460,64 @@ object Main extends TyrianIOApp[Msg, Model]:
     case CallOutcome.Failed(_)            => "Failed"
     case CallOutcome.Cancelled(_)         => "Cancelled"
 
-  private def detailView(call: CapturedCall): Html[Msg] =
+  private def detailView(call: CapturedCall, selectedTab: DetailTab): Html[Msg] =
     div()(
       h3(s"Call #${call.sequence}"),
+      tabBar(selectedTab),
+      selectedTab match
+        case DetailTab.Summary    => summaryTab(call)
+        case DetailTab.Messages   => messagesTab(call)
+        case DetailTab.RawRequest => rawRequestTab(call)
+        case DetailTab.Outcome    => outcomeTab(call)
+        case DetailTab.Headers    => headersTab(call)
+    )
+
+  private def tabBar(selectedTab: DetailTab): Html[Msg] =
+    div(`class` := "tab-bar")(
+      tabButton("Summary", DetailTab.Summary, selectedTab),
+      tabButton("Messages", DetailTab.Messages, selectedTab),
+      tabButton("Raw request", DetailTab.RawRequest, selectedTab),
+      tabButton("Outcome", DetailTab.Outcome, selectedTab),
+      tabButton("Headers", DetailTab.Headers, selectedTab)
+    )
+
+  private def tabButton(label: String, tab: DetailTab, selectedTab: DetailTab): Html[Msg] =
+    // DetailTab is a plain Scala 3 enum -- == works correctly for it
+    // out of the box (structural equality, same as a case class),
+    // nothing special needed the way Tyrian's own internal types
+    // sometimes require an explicit CanEqual instance.
+    val activeClass = if tab == selectedTab then "tab-button tab-button-active" else "tab-button"
+    button(onClick(Msg.SelectDetailTab(tab)), `class` := activeClass)(label)
+
+  private def summaryTab(call: CapturedCall): Html[Msg] =
+    div()(
       div(s"Provider: ${displayProvider(call.provider)}"),
       div(s"Model: ${call.model.getOrElse("-")}"),
       div(s"Step index: ${call.stepIndex.map(_.toString).getOrElse("-")}"),
       div(s"Received: ${formatEpochMillis(call.receivedAtEpochMillis)} (${call.receivedAtEpochMillis})"),
       div(s"Completed: ${formatEpochMillis(call.completedAtEpochMillis)} (${call.completedAtEpochMillis})"),
       div(s"Duration: ${call.durationMillis}ms"),
-      div(s"Streamed: ${call.streamed}"),
-      h4("Messages"),
-      div()(call.messages.map(m => div(s"[${m.role}] ${m.content}"))*),
-      h4("Raw request"),
-      pre(call.rawRequest.spaces2),
-      h4("Outcome"),
-      pre(renderOutcomeDetail(call.outcome))
+      div(s"Streamed: ${call.streamed}")
     )
+
+  private def messagesTab(call: CapturedCall): Html[Msg] =
+    div()(call.messages.map(m => div(s"[${m.role}] ${m.content}"))*)
+
+  private def rawRequestTab(call: CapturedCall): Html[Msg] =
+    pre(call.rawRequest.spaces2)
+
+  private def outcomeTab(call: CapturedCall): Html[Msg] =
+    pre(renderOutcomeDetail(call.outcome))
+
+  // New -- responseHeaders was already captured in CapturedCall (rate-
+  // limit headers, retry-after, vendor-specific metadata) but never
+  // actually rendered anywhere in the console before this. Vector[
+  // CapturedHeader], not a Map -- preserves duplicate names and
+  // original order, confirmed from CapturedHeader's own doc comment,
+  // so rendered in that same original order here rather than sorted.
+  private def headersTab(call: CapturedCall): Html[Msg] =
+    if call.responseHeaders.isEmpty then div(`class` := "status-message")("No response headers recorded for this call.")
+    else div()(call.responseHeaders.map(h => div(s"${h.name}: ${h.value}"))*)
 
   // js.Date, not java.time -- standard Scala.js library facade over
   // the browser's native Date, confirmed from Scala.js's own API docs
@@ -562,6 +604,12 @@ final case class Model(
     // moment either side of the console's data was confirmed current.
     lastRefreshedAt: Option[String],
     autoRefresh: Boolean,
+    // Global, not per-call -- deliberately. Switching to a different
+    // row while looking at, say, Raw request keeps that same tab
+    // active for the newly-selected call too, which is the more
+    // useful behavior for comparing the same field across calls
+    // rather than resetting to Summary every time.
+    selectedDetailTab: DetailTab,
     // None means "no filter" (show everything) for both -- not an
     // empty string or a sentinel value, so "not filtering" and
     // "filtering by nothing" can't be confused.
@@ -592,12 +640,16 @@ enum ActionState:
   case Succeeded(message: String)
   case Failed(message: String)
 
+enum DetailTab:
+  case Summary, Messages, RawRequest, Outcome, Headers
+
 enum Msg:
   case CallsLoaded(calls: List[CapturedCall])
   case FetchError(message: String)
   case DashboardLoaded(summary: DashboardSummary)
   case DashboardFetchError(message: String)
   case SelectCall(sequence: Long)
+  case SelectDetailTab(tab: DetailTab)
   case ResetClicked
   case RefreshClicked
   case ToggleAutoRefresh
