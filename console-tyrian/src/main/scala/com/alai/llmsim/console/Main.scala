@@ -264,15 +264,21 @@ object Main extends TyrianIOApp[Msg, Model]:
     )
 
   private def callRow(call: CapturedCall, selected: Boolean): Html[Msg] =
-    val rowStyle = if selected then "cursor: pointer; background-color: #eef4ff;" else "cursor: pointer;"
-    tr(onClick(Msg.SelectCall(call.sequence)), style := rowStyle)(
+    val rowClass = if selected then "row-selected" else ""
+    tr(onClick(Msg.SelectCall(call.sequence)), `class` := rowClass)(
       td(call.sequence.toString),
       td(call.provider),
       td(call.model.getOrElse("-")),
-      td(renderOutcome(call.outcome)),
+      td(`class` := outcomeClass(call.outcome))(renderOutcome(call.outcome)),
       td(if call.streamed then "yes" else "no"),
       td(call.durationMillis.toString)
     )
+
+  private def outcomeClass(outcome: CallOutcome): String = outcome match
+    case CallOutcome.Responded(_, _) => "outcome-responded"
+    case CallOutcome.Rejected(_, _)  => "outcome-rejected"
+    case CallOutcome.Failed(_)       => "outcome-failed"
+    case CallOutcome.Cancelled(_)    => "outcome-cancelled"
 
   // Compact, table-row-friendly -- no message text here, since a long
   // error message would make rows extremely tall. renderOutcomeDetail

@@ -4,6 +4,102 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>llmsim console</title>
+<style>
+  /* CSS in index.html, not Tyrian-side inline styles for everything --
+     `class` attribute confirmed working via a real Tyrian+Tailwind
+     example (github.com/zetashift/tyrian-vite-tailwindcss-example),
+     needing backticks in Main.scala since class is a Scala keyword.
+     Real CSS selectors here avoid needing to verify any further new
+     Tyrian attribute surface just to apply styling. */
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+    margin: 0;
+    padding: 16px;
+    color: #1a1a2e;
+    background: #f7f8fa;
+    line-height: 1.4;
+  }
+
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 12px 0;
+    background: white;
+  }
+
+  th, td {
+    padding: 6px 12px;
+    text-align: left;
+    border-bottom: 1px solid #e0e0e6;
+  }
+
+  th {
+    background: #eef0f4;
+    font-weight: 600;
+  }
+
+  tbody tr {
+    cursor: pointer;
+  }
+
+  tbody tr:hover {
+    background: #f4f6fb;
+  }
+
+  /* A real, distinct marker for the selected row -- not just a
+     background-color difference (the review's own explicit complaint
+     about the earlier version), so it's still clear which row is
+     selected even before considering color contrast/accessibility at
+     all. */
+  .row-selected {
+    background-color: #dde6fb !important;
+    border-left: 4px solid #4a67e0;
+  }
+
+  .outcome-responded { color: #1a7f37; font-weight: 600; }
+  .outcome-rejected  { color: #c2410c; font-weight: 600; }
+  .outcome-failed    { color: #b91c1c; font-weight: 600; }
+  .outcome-cancelled { color: #6b7280; font-weight: 600; }
+
+  button {
+    padding: 6px 12px;
+    margin: 2px 4px 2px 0;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    background: white;
+    cursor: pointer;
+    font-size: inherit;
+  }
+
+  button:hover:not(:disabled) {
+    background: #f0f2f7;
+  }
+
+  button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  input {
+    padding: 6px 10px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    font-size: inherit;
+  }
+
+  pre {
+    background: #f4f4f8;
+    padding: 8px 12px;
+    border-radius: 4px;
+    overflow-x: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  h3, h4 {
+    margin: 12px 0 6px 0;
+  }
+</style>
 </head>
 <body>
 <div id="myapp"></div>
