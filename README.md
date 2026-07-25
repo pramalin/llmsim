@@ -12,8 +12,6 @@ startup, by a script you write.
 
 ![llmsim in a development environment: the same agentic application, tool integrations, and data stay real across development/CI and QA/production -- only the LLM endpoint swaps between llmsim's simulated responses and a real model provider](docs/images/llmsim-architecture.png)
 
-![llmsim console: a real run of the VerificationFlow script, showing the call journal, summary cards, provider/outcome filters, and a selected tool-call's full request/response detail](docs/images/llmsim-console.png)
-
 ## Trying it out
 
 With `docker compose up` running, in another terminal:
@@ -693,6 +691,24 @@ renders it. It shows a "last refreshed" timestamp and a visible error
 banner if a poll fails, specifically so a broken connection reads as
 "this is stale," not as a dashboard that's silently frozen while still
 looking valid.
+
+## Console
+
+The full Tyrian console — built with Scala.js, see the Roadmap for why
+— served at `/_llmsim/console` once it's been built (automatically as
+part of the Docker image; see `console-tyrian/` for the source and dev
+workflow if you're working on it directly). Call journal with
+provider/outcome/streamed/model filters, live script status, manual
+and auto-refresh, and a tabbed detail view — Summary, Messages, Raw
+request, Outcome, Headers — for the selected call's complete
+request/response, including tool-call arguments and any captured
+response headers.
+
+```bash
+open http://localhost:8089/_llmsim/console
+```
+
+![llmsim console: a real run of the VerificationFlow script, showing the call journal, summary cards, provider/outcome filters, and a selected tool-call's full request/response detail on the Outcome tab](docs/images/llmsim-console.png)
 
 ## Using llmsim in an app's end-to-end tests
 
