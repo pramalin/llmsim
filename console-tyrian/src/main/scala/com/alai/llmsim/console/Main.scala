@@ -81,6 +81,7 @@ object Main extends TyrianIOApp[Msg, Model]:
   def view(model: Model): Html[Msg] =
     div()(
       scriptStatusView(model),
+      summaryStripView(model),
       controlPanel(model),
       contentView(model)
     )
@@ -101,6 +102,32 @@ object Main extends TyrianIOApp[Msg, Model]:
                 s" | Step ${d.script.nextStepIndex.map(_.toString).getOrElse("-")} of ${d.script.totalSteps}" +
                 s" | On overrun: ${d.script.onOverrun}$exhaustedNote"
             )
+
+  // "47 calls · 3 failures · 12 streamed · OpenAI 31 / Anthropic 16 ·
+  // p95 420 ms" -- makes the console read as a deterministic test-
+  // observation tool at a glance, not just a raw HTTP log. "failures"
+  // here means anything that isn't Responded (rejected + failed +
+  // cancelled combined) -- a quick health signal, not a breakdown;
+  // the full per-outcome split is still visible per-row in the table
+  // below. byOutcome/byProvider keys confirmed against Dashboard.scala's
+  // own KnownOutcomes/KnownProviders lists (always fully populated,
+  // defaulting to 0), not guessed.
+  private def summaryStripView(model: Model): Html[Msg] =
+    model.dashboard match
+      case None => div()
+      case Some(d) =>
+        val failures = d.calls.byOutcome.getOrElse("rejected", 0) +
+          d.calls.byOutcome.getOrElse("failed", 0) +
+          d.calls.byOutcome.getOrElse("cancelled", 0)
+        val p95Text = d.latencyMillis.p95.map(p => s"${p}ms").getOrElse("-")
+        div(
+          s"${d.journal.retainedCalls} call(s)" +
+            s" · $failures failure(s)" +
+            s" · ${d.calls.streamed} streamed" +
+            s" · OpenAI ${d.calls.byProvider.getOrElse("openai", 0)}" +
+            s" / Anthropic ${d.calls.byProvider.getOrElse("anthropic", 0)}" +
+            s" · p95 $p95Text"
+        )
 
   private def controlPanel(model: Model): Html[Msg] =
     val isPending = model.actionState match
@@ -168,11 +195,19 @@ object Main extends TyrianIOApp[Msg, Model]:
       td(call.durationMillis.toString)
     )
 
+  // Compact, table-row-friendly -- no message text here, since a long
+  // error message would make rows extremely tall. renderOutcomeDetail
+  // (used in the detail pane, not here) is where the full message
+  // lives; this one is deliberately just enough to scan a whole table
+  // at a glance. Kept the type names as they actually are in
+  // CallOutcome (Responded, not "Completed") for consistency with the
+  // rest of the codebase -- worth reconsidering if "Completed" reads
+  // better to someone who doesn't already know llmsim's internals.
   private def renderOutcome(outcome: CallOutcome): String = outcome match
-    case CallOutcome.Responded(status, _)      => s"Responded ($status)"
-    case CallOutcome.Rejected(status, message) => s"Rejected ($status): $message"
-    case CallOutcome.Failed(message)           => s"Failed: $message"
-    case CallOutcome.Cancelled(message)        => s"Cancelled: $message"
+    case CallOutcome.Responded(status, _) => s"Responded ($status)"
+    case CallOutcome.Rejected(status, _)  => s"Rejected ($status)"
+    case CallOutcome.Failed(_)            => "Failed"
+    case CallOutcome.Cancelled(_)         => "Cancelled"
 
   private def detailView(call: CapturedCall): Html[Msg] =
     div()(
