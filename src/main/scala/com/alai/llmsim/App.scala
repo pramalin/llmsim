@@ -2,10 +2,11 @@ package com.alai.llmsim
 
 import cats.effect.IO
 import cats.syntax.semigroupk._
-import org.http4s.{HttpApp, Uri}
+import org.http4s.{HttpApp, HttpRoutes, Uri}
 import org.http4s.headers.Origin
 import org.http4s.implicits._
 import org.http4s.server.middleware.CORS
+import org.http4s.server.staticcontent.resourceServiceBuilder
 
 /** Builds the full HttpApp for a given Script: a fresh ScriptRunner and
   * CallJournal, with the vendor-shaped simulator routes and the
@@ -30,8 +31,37 @@ object App {
       journal <- CallJournal.inMemory(journalMaxEntries)
     } yield withDevCors(
       (Simulator.routes(runner, journal) <+>
-        ManagementRoutes.routes(journal, runner, journalMaxEntries, scriptName)).orNotFound
+        ManagementRoutes.routes(journal, runner, journalMaxEntries, scriptName) <+>
+        consoleRoutes).orNotFound
     )
+
+  // Stage 1 of packaging the real Tyrian console (roadmap item 16)
+  // into the server itself. Serves whatever's under classpath
+  // resources at _llmsim/console/... at the SAME external URL prefix
+  // -- basePath and pathPrefix are two genuinely separate settings on
+  // ResourceServiceBuilder (basePath: classpath lookup location;
+  // pathPrefix: the external URL prefix routes actually match against,
+  // defaulting to "" if not set explicitly), confirmed from http4s's
+  // own Config docs after basePath alone produced a real 404 -- the
+  // routes were correctly finding files under _llmsim/console/ in the
+  // classpath, but expecting requests at the root, not under
+  // /_llmsim/console/ itself. A NEW path, not replacing the existing
+  // /_llmsim/ui bare-bones dashboard -- that stays exactly as it is
+  // until the Tyrian console is fully proven, a separate, later
+  // decision.
+  //
+  // Classpath-resource static serving in an assembled fat jar (this
+  // project's actual deployment shape, not `sbt run`) has a real,
+  // documented history (http4s/http4s#299, a double-slash path-
+  // normalization bug) -- from 2015, long before this project's
+  // 0.23.27, and narrow even at the time (a specific prefix-handling
+  // edge case, not "resources don't work in jars" the way the issue
+  // title alone might suggest). Worth knowing that history exists;
+  // not treated as a reason to expect it here.
+  private val consoleRoutes: HttpRoutes[IO] =
+    resourceServiceBuilder[IO]("/_llmsim/console")
+      .withPathPrefix("/_llmsim/console")
+      .toRoutes
 
   // Dev-only convenience, off unless explicitly requested: in
   // production the console is served by llmsim itself (same origin,
