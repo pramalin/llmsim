@@ -36,6 +36,24 @@
   th {
     background: #eef0f4;
     font-weight: 600;
+    /* position: sticky on individual th cells, not thead itself --
+       more consistently supported across browsers for table headers.
+       z-index and an opaque background keep scrolled body content
+       from showing through underneath. */
+    position: sticky;
+    top: 0;
+    z-index: 1;
+  }
+
+  .table-scroll {
+    max-height: 400px;
+    overflow-y: auto;
+    border: 1px solid #e0e0e6;
+    border-radius: 4px;
+  }
+
+  .table-scroll table {
+    margin: 0;
   }
 
   tbody tr {
@@ -78,6 +96,23 @@
   button:disabled {
     opacity: 0.5;
     cursor: not-allowed;
+  }
+
+  /* Overrides the general button styling above -- still a real
+     <button> underneath (keyboard-focusable, Enter/Space-activatable),
+     just visually plain so it doesn't look out of place sitting next
+     to ordinary table cells. Focus is still visible via the browser's
+     default outline, deliberately not suppressed -- removing focus
+     indicators would undo the accessibility point of using a real
+     button here in the first place. */
+  .seq-button {
+    background: none;
+    border: none;
+    padding: 0;
+    margin: 0;
+    font: inherit;
+    color: inherit;
+    cursor: pointer;
   }
 
   input {

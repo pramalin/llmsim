@@ -251,22 +251,36 @@ object Main extends TyrianIOApp[Msg, Model]:
     case CallOutcome.Cancelled(_)    => "cancelled"
 
   private def callsTable(calls: List[CapturedCall], selectedSequence: Option[Long]): Html[Msg] =
-    table()(
-      thead()(
-        tr()(
-          th("Seq"), th("Provider"), th("Model"), th("Outcome"), th("Streamed"), th("Duration (ms)")
-        )
-      ),
-      // Newest first -- explicit descending sort by sequence, not
-      // .reverse, so this doesn't depend on assuming the API always
-      // returns calls in a particular order.
-      tbody()(calls.sortBy(c => -c.sequence).map(call => callRow(call, selected = selectedSequence.contains(call.sequence)))*)
+    div(`class` := "table-scroll")(
+      table()(
+        thead()(
+          tr()(
+            th("Seq"), th("Provider"), th("Model"), th("Outcome"), th("Streamed"), th("Duration (ms)")
+          )
+        ),
+        // Newest first -- explicit descending sort by sequence, not
+        // .reverse, so this doesn't depend on assuming the API always
+        // returns calls in a particular order.
+        tbody()(calls.sortBy(c => -c.sequence).map(call => callRow(call, selected = selectedSequence.contains(call.sequence)))*)
+      )
     )
 
   private def callRow(call: CapturedCall, selected: Boolean): Html[Msg] =
     val rowClass = if selected then "row-selected" else ""
     tr(onClick(Msg.SelectCall(call.sequence)), `class` := rowClass)(
-      td(call.sequence.toString),
+      // A real button, not just the row's own onClick -- <tr> isn't
+      // keyboard-focusable or activatable by default (Tab won't reach
+      // it, Enter/Space won't trigger it), a real accessibility gap
+      // the review specifically flagged. <button> is natively
+      // keyboard-operable with no extra JS needed, so wrapping just
+      // the sequence number in one gives keyboard users a genuine way
+      // to reach this row's selection -- mouse users keep the
+      // existing "click anywhere in the row" behavior unchanged,
+      // since the tr's own onClick is still there too. Styled to look
+      // like plain text (seq-button class), not an obviously boxed
+      // button, so it doesn't look out of place next to the other
+      // cells.
+      td(button(onClick(Msg.SelectCall(call.sequence)), `class` := "seq-button")(call.sequence.toString)),
       td(call.provider),
       td(call.model.getOrElse("-")),
       td(`class` := outcomeClass(call.outcome))(renderOutcome(call.outcome)),
