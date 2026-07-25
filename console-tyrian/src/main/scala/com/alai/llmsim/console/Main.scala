@@ -46,7 +46,8 @@ object Main extends TyrianIOApp[Msg, Model]:
   def init(flags: Map[String, String]): (Model, Cmd[IO, Msg]) =
     (
       Model(calls = Nil, error = None, loading = true, dashboard = None, dashboardError = None,
-        selectedSequence = None, actionState = ActionState.Idle),
+        selectedSequence = None, actionState = ActionState.Idle,
+        providerFilter = None, outcomeFilter = None, streamedOnly = false),
       Cmd.Batch(List(fetchCalls, fetchDashboard))
     )
 
@@ -76,6 +77,9 @@ object Main extends TyrianIOApp[Msg, Model]:
       (model.copy(actionState = ActionState.Succeeded(msg), selectedSequence = None),
         Cmd.Batch(List(fetchCalls, fetchDashboard)))
     case Msg.ActionFailed(msg) => (model.copy(actionState = ActionState.Failed(msg)), Cmd.None)
+    case Msg.SetProviderFilter(p) => (model.copy(providerFilter = p), Cmd.None)
+    case Msg.SetOutcomeFilter(o)  => (model.copy(outcomeFilter = o), Cmd.None)
+    case Msg.ToggleStreamedOnly   => (model.copy(streamedOnly = !model.streamedOnly), Cmd.None)
     case Msg.NoOp                => (model, Cmd.None)
 
   def view(model: Model): Html[Msg] =
@@ -170,9 +174,63 @@ object Main extends TyrianIOApp[Msg, Model]:
         case None =>
           if model.calls.isEmpty then div("No calls yet.")
           else
-            val selected = model.selectedSequence.flatMap(seq => model.calls.find(_.sequence == seq))
-            val children: List[Html[Msg]] = callsTable(model.calls, model.selectedSequence) :: selected.map(detailView).toList
+            val filtered = model.calls.filter(matchesFilters(_, model))
+            val selected = model.selectedSequence.flatMap(seq => filtered.find(_.sequence == seq))
+            // filtered.isEmpty is genuinely different from
+            // model.calls.isEmpty above -- "the journal has nothing"
+            // vs "the journal has data, the current filter just hides
+            // all of it" are different situations, and a reader
+            // switching filters needs to be able to tell them apart.
+            val tableOrEmptyNote: Html[Msg] =
+              if filtered.isEmpty then div("No calls match the current filters.")
+              else callsTable(filtered, model.selectedSequence)
+            val children: List[Html[Msg]] =
+              filterPanel(model) :: tableOrEmptyNote :: selected.map(detailView).toList
             div()(children*)
+
+  // Button-toggle filters, not <select> dropdowns -- select/option and
+  // how their change events surface a value are genuinely unverified
+  // in this Tyrian setup (unlike table/h3/pre/style, which all came
+  // from real confirmed examples), and this step already introduces
+  // enough new Model/Msg surface without stacking an unconfirmed UI
+  // pattern on top. Functionally equivalent; visual polish to match
+  // the mockup's dropdowns is a separate, later styling pass.
+  private def filterPanel(model: Model): Html[Msg] =
+    div()(
+      div("Provider:"),
+      filterToggle("All", model.providerFilter.isEmpty, Msg.SetProviderFilter(None)),
+      filterToggle("OpenAI", model.providerFilter.contains("openai"), Msg.SetProviderFilter(Some("openai"))),
+      filterToggle("Anthropic", model.providerFilter.contains("anthropic"), Msg.SetProviderFilter(Some("anthropic"))),
+      div("Outcome:"),
+      filterToggle("All", model.outcomeFilter.isEmpty, Msg.SetOutcomeFilter(None)),
+      filterToggle("Responded", model.outcomeFilter.contains("responded"), Msg.SetOutcomeFilter(Some("responded"))),
+      filterToggle("Rejected", model.outcomeFilter.contains("rejected"), Msg.SetOutcomeFilter(Some("rejected"))),
+      filterToggle("Failed", model.outcomeFilter.contains("failed"), Msg.SetOutcomeFilter(Some("failed"))),
+      filterToggle("Cancelled", model.outcomeFilter.contains("cancelled"), Msg.SetOutcomeFilter(Some("cancelled"))),
+      button(onClick(Msg.ToggleStreamedOnly))(
+        if model.streamedOnly then "Streamed only: On" else "Streamed only: Off"
+      )
+    )
+
+  private def filterToggle(label: String, active: Boolean, msg: Msg): Html[Msg] =
+    val activeStyle = if active then "font-weight: bold; text-decoration: underline;" else ""
+    button(onClick(msg), style := activeStyle)(label)
+
+  private def matchesFilters(call: CapturedCall, model: Model): Boolean =
+    val providerOk = model.providerFilter.forall(_ == call.provider)
+    val outcomeOk  = model.outcomeFilter.forall(_ == outcomeKey(call.outcome))
+    val streamedOk = !model.streamedOnly || call.streamed
+    providerOk && outcomeOk && streamedOk
+
+  // Matches Dashboard.scala's own outcomeKey exactly (responded/
+  // rejected/failed/cancelled) -- the same lowercase discriminator
+  // values byOutcome's keys already use, confirmed there, not
+  // reguessed here.
+  private def outcomeKey(outcome: CallOutcome): String = outcome match
+    case CallOutcome.Responded(_, _) => "responded"
+    case CallOutcome.Rejected(_, _)  => "rejected"
+    case CallOutcome.Failed(_)       => "failed"
+    case CallOutcome.Cancelled(_)    => "cancelled"
 
   private def callsTable(calls: List[CapturedCall], selectedSequence: Option[Long]): Html[Msg] =
     table()(
@@ -289,7 +347,13 @@ final case class Model(
     dashboard: Option[DashboardSummary],
     dashboardError: Option[String],
     selectedSequence: Option[Long],
-    actionState: ActionState
+    actionState: ActionState,
+    // None means "no filter" (show everything) for both -- not an
+    // empty string or a sentinel value, so "not filtering" and
+    // "filtering by nothing" can't be confused.
+    providerFilter: Option[String],
+    outcomeFilter: Option[String],
+    streamedOnly: Boolean
 )
 
 enum Action:
@@ -319,4 +383,7 @@ enum Msg:
   case ClearClicked
   case ActionSucceeded(message: String)
   case ActionFailed(message: String)
+  case SetProviderFilter(provider: Option[String])
+  case SetOutcomeFilter(outcome: Option[String])
+  case ToggleStreamedOnly
   case NoOp
