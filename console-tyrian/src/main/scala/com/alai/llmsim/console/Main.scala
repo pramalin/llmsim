@@ -49,11 +49,33 @@ object Main extends TyrianIOApp[Msg, Model]:
   def init(flags: Map[String, String]): (Model, Cmd[IO, Msg]) =
     (
       Model(calls = Nil, error = None, loading = true, dashboard = None, dashboardError = None,
-        selectedSequence = None, actionState = ActionState.Idle, refreshing = false, lastRefreshedAt = None,
+        selectedSequence = None, actionState = ActionState.Idle,
+        refreshPending = Set(RefreshPart.Calls, RefreshPart.Dashboard), lastRefreshedAt = None,
         autoRefresh = false, selectedDetailTab = DetailTab.Summary,
         providerFilter = None, outcomeFilter = None, streamedOnly = false, modelSearch = ""),
       Cmd.Batch(List(fetchCalls, fetchDashboard))
     )
+
+  // True only while a Reset or Clear request is actually in flight --
+  // NOT true for Succeeded/Failed, which persist indefinitely as
+  // status text until the next click, unlike a review suggestion of
+  // "actionState != Idle" would imply. Using that literal check would
+  // have permanently blocked auto-refresh after the very first
+  // Reset/Clear, since actionState never reverts to Idle on its own.
+  private def actionInProgress(model: Model): Boolean = model.actionState match
+    case ActionState.Pending(_) => true
+    case _                      => false
+
+  private def canRefreshNow(model: Model): Boolean =
+    model.refreshPending.isEmpty && !actionInProgress(model)
+
+  private def beginRefresh(model: Model): (Model, Cmd[IO, Msg]) =
+    (model.copy(refreshPending = Set(RefreshPart.Calls, RefreshPart.Dashboard)), Cmd.Batch(List(fetchCalls, fetchDashboard)))
+
+  // Only sets lastRefreshedAt once refreshPending is genuinely empty --
+  // both calls and dashboard resolved, not just whichever was faster.
+  private def completeRefreshIfDone(model: Model): Model =
+    if model.refreshPending.isEmpty then model.copy(lastRefreshedAt = Some(nowText)) else model
 
   def update(model: Model): Msg => (Model, Cmd[IO, Msg]) =
     // error/dashboardError are NEVER cleared on failure now, deliberately
@@ -65,22 +87,35 @@ object Main extends TyrianIOApp[Msg, Model]:
     // previous journal when a refresh fails" -- clearing error only
     // ever happens on a NEW success, not as part of showing one.
     case Msg.CallsLoaded(calls) =>
-      (model.copy(calls = calls, error = None, loading = false, refreshing = false, lastRefreshedAt = Some(nowText)), Cmd.None)
+      (completeRefreshIfDone(model.copy(calls = calls, error = None, loading = false,
+        refreshPending = model.refreshPending - RefreshPart.Calls)), Cmd.None)
     case Msg.FetchError(err) =>
-      (model.copy(error = Some(err), loading = false, refreshing = false), Cmd.None)
+      (completeRefreshIfDone(model.copy(error = Some(err), loading = false,
+        refreshPending = model.refreshPending - RefreshPart.Calls)), Cmd.None)
     case Msg.DashboardLoaded(summary) =>
-      (model.copy(dashboard = Some(summary), dashboardError = None, refreshing = false, lastRefreshedAt = Some(nowText)), Cmd.None)
+      (completeRefreshIfDone(model.copy(dashboard = Some(summary), dashboardError = None,
+        refreshPending = model.refreshPending - RefreshPart.Dashboard)), Cmd.None)
     case Msg.DashboardFetchError(err) =>
-      (model.copy(dashboardError = Some(err), refreshing = false), Cmd.None)
+      (completeRefreshIfDone(model.copy(dashboardError = Some(err),
+        refreshPending = model.refreshPending - RefreshPart.Dashboard)), Cmd.None)
     case Msg.SelectCall(seq)    => (model.copy(selectedSequence = Some(seq)), Cmd.None)
     case Msg.SelectDetailTab(tab) => (model.copy(selectedDetailTab = tab), Cmd.None)
     case Msg.RefreshClicked =>
-      // Not destructive like Reset/Clear, so no ActionState needed --
-      // just a plain guard against a redundant fetch if one's already
-      // in flight.
-      if model.refreshing then (model, Cmd.None)
-      else (model.copy(refreshing = true), Cmd.Batch(List(fetchCalls, fetchDashboard)))
-    case Msg.ToggleAutoRefresh => (model.copy(autoRefresh = !model.autoRefresh), Cmd.None)
+      if canRefreshNow(model) then beginRefresh(model) else (model, Cmd.None)
+    case Msg.AutoRefreshTick =>
+      // Same guard and same beginRefresh as a manual click -- ignoring
+      // a tick that arrives while a refresh or a Reset/Clear is
+      // already in flight, rather than suspending the subscription
+      // itself, which would mean repeatedly stopping and restarting
+      // the timer instead of just skipping a beat.
+      if canRefreshNow(model) then beginRefresh(model) else (model, Cmd.None)
+    case Msg.ToggleAutoRefresh =>
+      val turningOn = !model.autoRefresh
+      val toggled = model.copy(autoRefresh = turningOn)
+      // Enabling starts one refresh immediately rather than waiting
+      // out the first full interval -- otherwise turning it on does
+      // nothing visible for up to AutoRefreshInterval.
+      if turningOn && canRefreshNow(toggled) then beginRefresh(toggled) else (toggled, Cmd.None)
     case Msg.ResetClicked =>
       model.actionState match
         // The real safety net against double-clicks: ignored outright
@@ -98,8 +133,11 @@ object Main extends TyrianIOApp[Msg, Model]:
       // changed either way, but script position only changes for
       // Reset, so both need refreshing for that difference to actually
       // show up here rather than needing a separate curl to see.
-      (model.copy(actionState = ActionState.Succeeded(msg), selectedSequence = None),
-        Cmd.Batch(List(fetchCalls, fetchDashboard)))
+      // Routed through beginRefresh (not a bare Cmd.Batch) so this
+      // re-fetch is also tracked in refreshPending -- a stray
+      // auto-refresh tick arriving during this window is correctly
+      // guarded against the same way any other overlapping refresh is.
+      beginRefresh(model.copy(actionState = ActionState.Succeeded(msg), selectedSequence = None))
     case Msg.ActionFailed(msg) => (model.copy(actionState = ActionState.Failed(msg)), Cmd.None)
     case Msg.SetProviderFilter(p) => (model.copy(providerFilter = p), Cmd.None)
     case Msg.SetOutcomeFilter(o)  => (model.copy(outcomeFilter = o), Cmd.None)
@@ -127,24 +165,16 @@ object Main extends TyrianIOApp[Msg, Model]:
       div(`class` := "app-tagline")("Deterministic LLM API simulation and request inspection")
     )
 
-  // Sub.every genuinely doesn't exist in this Tyrian version -- Sub.
-  // fromStream does, confirmed by extracting Sub.scala directly from
-  // the resolved sources jar for the exact pinned artifact
-  // (io.indigoengine:tyrian-platform_sjs1_3:0.30.0-M4-PREVIEW, fetched
-  // via `cs fetch --sources` and inspected directly), not inferred
-  // from an example or a different version this time. Real signature:
-  // def fromStream[F[_]: Async, A](id: String, stream: Stream[F, A]):
-  // Sub[F, A] -- takes an explicit id and an fs2.Stream, IO already
-  // satisfies Async[F]. Stream.awakeEvery is standard, stable FS2
-  // (already a real dependency here via http4s-dom), not another
-  // Tyrian preview internal to verify. .as(Msg.RefreshClicked) makes
-  // the stream already produce Msg directly, so fromStream needs no
-  // further .map -- reuses the already-proven RefreshClicked handling
-  // entirely, including its guard against overlapping fetches, rather
-  // than introducing a parallel path just for the timer case.
+  private val AutoRefreshInterval = 3.seconds
+  private val AutoRefreshSubscriptionId = "console-auto-refresh"
+
+  // The pinned Tyrian platform API (0.30.0-M4-PREVIEW) provides
+  // periodic subscriptions through Sub.fromStream, not Sub.every --
+  // confirmed against the actual resolved sources jar, not inferred
+  // from an example or a different version.
   def subscriptions(model: Model): Sub[IO, Msg] =
     if model.autoRefresh then
-      Sub.fromStream("console-auto-refresh", Stream.awakeEvery[IO](3.seconds).as(Msg.RefreshClicked))
+      Sub.fromStream(AutoRefreshSubscriptionId, Stream.awakeEvery[IO](AutoRefreshInterval).as(Msg.AutoRefreshTick))
     else Sub.None
 
   private def scriptStatusView(model: Model): Html[Msg] =
@@ -275,7 +305,7 @@ object Main extends TyrianIOApp[Msg, Model]:
       // update against a redundant fetch already covers the double-
       // click case without needing the full Pending/Succeeded/Failed
       // machinery.
-      if model.refreshing then button(onClick(Msg.RefreshClicked), disabled)("Refresh")
+      if model.refreshPending.nonEmpty then button(onClick(Msg.RefreshClicked), disabled)("Refresh")
       else button(onClick(Msg.RefreshClicked))("Refresh"),
       // Same checkbox-glyph-on-a-plain-button pattern as the
       // streamed-only filter toggle -- proven, no new attribute
@@ -595,13 +625,20 @@ final case class Model(
     dashboardError: Option[String],
     selectedSequence: Option[Long],
     actionState: ActionState,
-    // True only while an explicit Refresh is in flight -- separate
-    // from `loading` (the very first fetch), so the UI can say
-    // "Refreshing..." rather than reusing the initial-load message.
-    refreshing: Boolean,
-    // Human-readable, set on any successful calls or dashboard fetch
-    // (whichever completes first) -- a plain timestamp of the last
-    // moment either side of the console's data was confirmed current.
+    // Empty means no refresh in flight. Tracks calls and dashboard as
+    // two independent parts, not a single Boolean -- a real bug caught
+    // by review: since both are fetched concurrently via Cmd.Batch,
+    // whichever completes first was clearing a single "refreshing"
+    // flag even while the other was still in flight, letting a timer
+    // tick start an overlapping second refresh. Empty only once BOTH
+    // parts have resolved (success or failure), not whichever is
+    // faster.
+    refreshPending: Set[RefreshPart],
+    // Set only when refreshPending becomes empty (the full cycle
+    // finished), not whichever of calls/dashboard happens to resolve
+    // first -- same reasoning as refreshPending above: "Updated ..."
+    // showing a time while the other half was still in flight would
+    // imply everything was current when only one side actually was.
     lastRefreshedAt: Option[String],
     autoRefresh: Boolean,
     // Global, not per-call -- deliberately. Switching to a different
@@ -640,6 +677,9 @@ enum ActionState:
   case Succeeded(message: String)
   case Failed(message: String)
 
+enum RefreshPart:
+  case Calls, Dashboard
+
 enum DetailTab:
   case Summary, Messages, RawRequest, Outcome, Headers
 
@@ -652,6 +692,7 @@ enum Msg:
   case SelectDetailTab(tab: DetailTab)
   case ResetClicked
   case RefreshClicked
+  case AutoRefreshTick
   case ToggleAutoRefresh
   case ClearClicked
   case ActionSucceeded(message: String)
