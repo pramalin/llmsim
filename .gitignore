@@ -4,6 +4,13 @@ project/target/
 project/project/
 *.class
 
+# npm / Vite build output (console-tyrian) -- node_modules is
+# regenerated entirely from package.json + package-lock.json via
+# `npm install`, never meant to be committed; dist/ is npm run build's
+# output, same story.
+node_modules/
+dist/
+
 # Metals / Bloop (Scala IDE tooling)
 .bloop/
 .bsp/
