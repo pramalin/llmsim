@@ -14,7 +14,13 @@ startup, by a script you write.
 
 ## Trying it out
 
-With `docker compose up` running, in another terminal:
+No API key, no model download, no network access needed.
+
+```bash
+docker compose up
+```
+
+With that running, in another terminal:
 
 ```bash
 curl -s -X POST http://localhost:8089/v1/chat/completions \
@@ -748,7 +754,7 @@ against it rather than it being something already fully built. Your own
 project's script never needs to live inside llmsim's repo, and llmsim's
 engine source never needs to be copied into yours.
 
-**Pin a released version** (`llmsim-build:0.2.0`, as below) in application
+**Pin a released version** (`llmsim-build:0.10.1`, as below) in application
 repositories — an unrelated llmsim release shouldn't be able to break your
 build out from under you. `:latest` exists for quickly evaluating llmsim
 itself, not for building on top of.
@@ -757,7 +763,7 @@ Your project gets its own tiny `Dockerfile` (e.g. `llmsim/Dockerfile` in
 your repo) that layers just your script on top of the published engine:
 
 ```dockerfile
-FROM ghcr.io/pramalin/llmsim-build:0.2.0 AS build
+FROM ghcr.io/pramalin/llmsim-build:0.10.1 AS build
 COPY AnalyticsFlow.scala /build/src/main/scala/com/example/agenticanalytics/llmsim/AnalyticsFlow.scala
 RUN sbt assembly
 
